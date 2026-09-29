@@ -298,11 +298,15 @@ def gb10() -> bool:
         return False
     return tuple(torch.cuda.get_device_capability(0)) == (12, 1) or "GB10" in torch.cuda.get_device_name(0)
 
+# the KV cache dtypes the CUDA engine can allocate (``--kv-dtype``; fp8: packed rows, ROCm's WMMA attention only)
+CUDA_KV_DTYPES = ("bf16", "fp8")
 
 def cuda_engine(model_dir: str | Path, *, drafter: str = "", tp: int = 1, rank: int = 0, master: str = "",
-                master_port: int = 29551, no_drafts: bool = False, **options: Any):
+                master_port: int = 29551, no_drafts: bool = False, kv_dtype: str = "bf16", **options: Any):
     """The CUDA engine for ``tensorfold serve``; tp=2 adds fp32 partials in rank order and needs the drafter on both."""
 
+    if kv_dtype not in CUDA_KV_DTYPES:       # refuse an unknown cache before any weight is read (no torch import)
+        raise ValueError(f"kv-dtype {kv_dtype!r}: this engine serves {' or '.join(CUDA_KV_DTYPES)}")
     from .cuda.engine import Qwen27Engine
     from .cuda.exl3_load import quant_config
 
@@ -326,4 +330,5 @@ def cuda_engine(model_dir: str | Path, *, drafter: str = "", tp: int = 1, rank: 
                         split_head=tp == 2, tp_draft=tp == 2 and draft is not None, allow_copy=not no_drafts,
                         streams=streams, context=options.get("context"),
                         context_explicit=options.get("context_explicit"), vision=bool(options.get("vision", False)),
-                        vision_urls=bool(options.get("vision_urls", False)), keep=options.get("checkpoint_slots"))
+                        vision_urls=bool(options.get("vision_urls", False)), keep=options.get("checkpoint_slots"),
+                        kv_fp8=kv_dtype == "fp8")
