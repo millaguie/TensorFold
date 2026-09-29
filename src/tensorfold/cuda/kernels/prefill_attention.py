@@ -11,6 +11,7 @@ import triton.language as tl
 
 from tensorfold.cuda.build import gfx12, hip
 
+ROWS2 = 192              # ROCm: prompt rows from which a block takes two 16-row tiles (128: one was faster)
 BM = 64
 BN = 64
 
@@ -84,7 +85,7 @@ def attention(q: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor, p0:
     out = torch.empty_like(q)
     if gfx12():                            # RDNA4: the schedules measured on the R9700
         if _rocm_kernel(h, hk, d):
-            _rocm().attention(q, k_cache, v_cache, out, p0, scale)
+            _rocm().attention(q, k_cache, v_cache, out, p0, scale, *rocm_rows(w))
             return out
         return _rocm_attention(q, k_cache, v_cache, out, p0, scale)
     if d == 64 or hip():                   # other ROCm GPUs: the CUDA kernel is inline PTX; the Triton definition runs
@@ -155,14 +156,21 @@ def rocm_config() -> tuple[int, int, int, int, int]:
     return values
 
 
-@lru_cache(maxsize=1)
 def _rocm():
-    from tensorfold.cuda.build import load
+    from tensorfold.cuda.kernels.attention import _rocm as extension     # prompt and tree attention: one extension
 
-    here = Path(__file__).parent
-    return load(name="tensorfold_attention_rocm_v8",
-                sources=[str(here / "attention_rocm.cpp"), str(here / "attention_rocm.cu")],
-                extra_cuda_cflags=["-O3"], verbose=False)
+    return extension()
+
+
+def rocm_rows(w: int) -> tuple[int, bool]:
+    """(16-row tiles a block, loader waves or not) for ``attention_rocm.cu``'s prompt kernel: two tiles and loaders
+    from ``ROWS2`` prompt rows, one tile below it (twice the blocks). Never a row's bits; ``TF_ROCM_ATTN_RB`` and
+    ``TF_ROCM_ATTN_PIPE`` override them for tuning."""
+
+    import os
+
+    rb = int(os.environ.get("TF_ROCM_ATTN_RB") or (2 if w >= ROWS2 else 1))
+    return rb, os.environ.get("TF_ROCM_ATTN_PIPE", "1") != "0"
 
 
 def _rocm_kernel(heads: int, kv_heads: int, dim: int) -> bool:
