@@ -6,6 +6,7 @@
 #include <cuda_runtime.h>
 
 #include <cstdint>
+#include <cstdlib>
 
 // ROCm builds (hipified): 64-bit lane masks, HIP's bf16 conversion (round to nearest even) and a kernel
 // pointer cast for the attribute call; on CUDA each macro is exactly the original spelling.
@@ -371,7 +372,20 @@ void dispatch_tree(int slots, const at::Tensor& q, const at::Tensor& k, const at
     // many-SM sm_120: several streams take 8 rows a warp (fewer instructions a row), one stream 4 (warps for every SM)
     const auto* prop = at::cuda::getCurrentDeviceProperties();
     const bool wide = streams >= 2 && prop->major == 12 && prop->minor == 0 && prop->multiProcessorCount >= 96;
+#ifdef __HIPCC__
+    // ROCm: a chain's value rows a warp from TF_ROCM_TREE_R (2, 4 or 8; 4 halved the R9700's verify chain against 8);
+    // a row's arithmetic is the same at any
+    static const int chain_rows = [] {
+        const char* env = std::getenv("TF_ROCM_TREE_R");
+        const int r = env != nullptr ? std::atoi(env) : 4;
+        return r == 2 || r == 8 ? r : 4;
+    }();
+    if (slots == 0 && chain_rows == 2) TREE(0, 2, 4, true);
+    else if (slots == 0 && chain_rows == 4) TREE(0, 4, 4, true);
+    else if (slots == 0) TREE(0, 8, 4, true);
+#else
     if (slots == 0) TREE(0, 8, 4, true);
+#endif
     else if (wide && slots <= 1) TREE_(1, 8, 4);
     else if (wide && slots <= 2) TREE_(2, 8, 2);
     else if (slots <= 2) TREE_(2, 4, 4);

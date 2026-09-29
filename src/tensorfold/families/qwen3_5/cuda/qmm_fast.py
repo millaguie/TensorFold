@@ -4,16 +4,23 @@ from __future__ import annotations
 
 import torch
 
+from tensorfold.cuda.build import gfx12, hip
 from tensorfold.cuda.kernels import qmm as shared
+from tensorfold.cuda.kernels import qmm_groups as groups
 
 from .qmm import lane_matmul
 from .weights import QLinear, Weights
 
 
 def tile(q: QLinear) -> QLinear:
-    from tensorfold.cuda.rocm import HIP
+    """The packed decode layout: tensor-core fragments on NVIDIA, 16-output tiles on RDNA4 (``qmm_groups``), the stored
+    layout on other ROCm GPUs (the Triton lane matmul and ``qgemv``)."""
 
-    if q.layout == "tiled" or not q.fast or HIP:     # ROCm: the stored layout and the Triton lane matmul
+    if q.layout in ("tiled", "groups") or not q.fast:
+        return q
+    if gfx12():
+        return QLinear(*groups.to_groups(q.weight, q.scales, q.biases), layout="groups", rows=q.n)
+    if hip():
         return q
     p = shared.pack(q.weight, q.scales, q.biases, 64)
     return QLinear(p.weight, p.scales, p.biases, layout="tiled", rows=q.n)
@@ -22,6 +29,8 @@ def tile(q: QLinear) -> QLinear:
 def untile(q: QLinear) -> QLinear:
     """The stored MLX layout again (for the fp32 reference, TP sharding or slicing rows)."""
 
+    if q.layout == "groups":
+        return QLinear(*groups.from_groups(q.weight, q.scales, q.biases, q.n))
     if q.layout != "tiled":
         return q
     return QLinear(*shared.unpack(shared.Q4(q.weight, q.scales, q.biases, q.n, q.k, 64)))
@@ -65,9 +74,11 @@ def matmul(x: torch.Tensor, q: QLinear, xs: torch.Tensor | None = None) -> torch
         return affine_matmul(x, q)
     if q.layout == "tiled":
         return shared.matmul(x, q, xs)
-    from tensorfold.cuda.rocm import HIP
-
-    if HIP:                                          # decode and verify rows: the row-invariant 4-bit decode kernel
+    if q.layout == "groups":
+        return groups.matmul(x, q.weight, q.scales, q.biases, q.n, xs)
+    if gfx12():                                      # one RDNA4 kernel for either layout, so they share bits
+        return groups.matmul(x, *groups.to_groups(q.weight, q.scales, q.biases), q.n, xs)
+    if hip():                                        # decode and verify rows: the row-invariant 4-bit decode kernel
         from .qgemv import decode_matmul
 
         return decode_matmul(x, q.weight, q.scales, q.biases)
@@ -117,6 +128,23 @@ def stack_small(layer) -> None:
         layer.gdn.zba = stack([layer.gdn.z, layer.gdn.b, layer.gdn.a])
     if layer.attn is not None and layer.attn.kv is None and _stackable([layer.attn.k, layer.attn.v]):
         layer.attn.kv = stack([layer.attn.k, layer.attn.v])
+    # RDNA4: [gate | up] too, a larger call streaming nearer the bandwidth; its members become views, so no copy stays
+    if gfx12() and layer.gate is not None and layer.gu is None and _stackable([layer.gate, layer.up]):
+        layer.gu = stack([layer.gate, layer.up])
+
+
+def _members(stacked: QLinear, parts: list[QLinear]) -> list[QLinear] | None:
+    """ROCm: the stacked tiles' rows as each member's weight (views, no copy) when every member fills whole tiles."""
+
+    if stacked.layout != "groups" or any(q.n % 16 for q in parts):
+        return None
+    out, t0 = [], 0
+    for q in parts:
+        t1 = t0 + q.n // 16
+        out.append(QLinear(stacked.weight[t0:t1], stacked.scales[t0:t1], stacked.biases[t0:t1], layout="groups",
+                           rows=q.n))
+        t0 = t1
+    return out
 
 
 def prepare(w: Weights, *, fuse: bool = False) -> None:
@@ -125,15 +153,26 @@ def prepare(w: Weights, *, fuse: bool = False) -> None:
     for layer in w.layers:
         if fuse:
             stack_small(layer)
+        if layer.gdn is not None and layer.gdn.zba is not None:
+            layer.gdn.zba = tile(layer.gdn.zba)
+            views = _members(layer.gdn.zba, [layer.gdn.z, layer.gdn.b, layer.gdn.a])
+            if views is not None:
+                layer.gdn.z, layer.gdn.b, layer.gdn.a = views
+        if layer.attn is not None and layer.attn.kv is not None:
+            layer.attn.kv = tile(layer.attn.kv)
+            views = _members(layer.attn.kv, [layer.attn.k, layer.attn.v])
+            if views is not None:
+                layer.attn.k, layer.attn.v = views
+        if layer.gu is not None:
+            layer.gu = tile(layer.gu)
+            views = _members(layer.gu, [layer.gate, layer.up])
+            if views is not None:
+                layer.gate, layer.up = views
         for owner, names in ((layer, ("gate", "up", "down")), (layer.gdn, ("qkv", "z", "b", "a", "out")),
                              (layer.attn, ("q", "k", "v", "o"))):
             if owner is None:
                 continue
             for name in names:
                 setattr(owner, name, tile(getattr(owner, name)))
-        if layer.gdn is not None and layer.gdn.zba is not None:
-            layer.gdn.zba = tile(layer.gdn.zba)
-        if layer.attn is not None and layer.attn.kv is not None:
-            layer.attn.kv = tile(layer.attn.kv)
     w.head = tile(w.head)
     torch.cuda.empty_cache()

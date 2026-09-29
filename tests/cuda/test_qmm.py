@@ -6,6 +6,11 @@ import torch
 if not torch.cuda.is_available():
     pytest.skip("CUDA only", allow_module_level=True)
 
+from tensorfold.cuda.build import hip  # noqa: E402
+
+if hip():
+    pytest.skip("NVIDIA tensor-core kernels (PTX MMA and clusters)", allow_module_level=True)
+
 from tensorfold.cuda.kernels import qmm  # noqa: E402
 from tensorfold.cuda.rocm import HIP  # noqa: E402
 

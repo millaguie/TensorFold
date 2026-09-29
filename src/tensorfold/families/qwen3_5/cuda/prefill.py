@@ -9,8 +9,10 @@ import numpy as np
 import torch
 
 from tensorfold.cuda import moe, prompt_precision
+from tensorfold.cuda.build import gfx12, hip
 from tensorfold.cuda.kernels import gdn as deltanet
 from tensorfold.cuda.kernels import qmm as shared
+from tensorfold.cuda.kernels import qmm_groups as groups
 from tensorfold.cuda.kernels.prefill_attention import attention
 
 from . import glue
@@ -28,12 +30,16 @@ def _mm(x, w: QLinear, f32: bool = False) -> torch.Tensor:
     """``x``: bf16 rows (``prefill_bf16``), or e4m3 rows with group sums and row scales (``prefill_glue``, FP8)."""
 
     if isinstance(x, tuple):
+        if gfx12() and isinstance(w, QLinear):            # RDNA4: the codes as e4m3 once, then a fixed-tile GEMM
+            g = tile(w)
+            return groups.prefill_matmul8(x, g.weight, g.scales, g.biases, g.n, f32=f32)
         return shared.prefill_matmul8(x, tile(w), f32=f32) if isinstance(w, QLinear) else w.prefill8(x)
     if not isinstance(w, QLinear):
         return w.prefill(x)                               # an EXL3 pack's or an NVFP4 checkpoint's projection
-    from tensorfold.cuda.rocm import HIP
-
-    if HIP and not f32 and w.fast and w.layout == "mlx":   # ROCm prompts: the batched Triton lane matmul
+    if gfx12() and w.fast:                                # RDNA4: weights rounded once to bf16, fixed-tile GEMM
+        g = tile(w)
+        return groups.prefill_matmul(x, g.weight, g.scales, g.biases, g.n, f32=f32)
+    if hip() and not f32 and w.fast and w.layout == "mlx":   # other ROCm GPUs: the batched Triton lane matmul
         from .qmm import lane_matmul
 
         return lane_matmul(x, w.weight, w.scales, w.biases)

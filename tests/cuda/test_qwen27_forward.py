@@ -6,6 +6,7 @@ import torch
 if not torch.cuda.is_available():
     pytest.skip("CUDA only", allow_module_level=True)
 
+from tensorfold.cuda.build import gfx12, hip
 from tensorfold.families.qwen3_5.cuda.forward import State, commit, tree_forward
 from tensorfold.families.qwen3_5.cuda.decode import draft_decode, serial_decode
 from tensorfold.families.qwen3_5.cuda.weights import Config, GDN, Layer, QLinear, Weights
@@ -82,10 +83,8 @@ def test_tiled_weights_give_the_same_bits():
     w = _model()
     tiled = copy.deepcopy(w)
     qmm_fast.prepare(tiled, fuse=False)
-    from tensorfold.cuda.rocm import HIP
-
-    layout = "mlx" if HIP else "tiled"               # ROCm keeps the stored layout (no sm_90 tiles)
-    assert tiled.head.layout == layout and tiled.layers[0].gate.layout == layout
+    packed = "groups" if gfx12() else "mlx" if hip() else "tiled"     # other ROCm GPUs keep the stored layout
+    assert tiled.head.layout == packed and tiled.layers[0].gate.layout == packed
     tokens = torch.tensor([7, 8, 9, 10, 11], device="cuda", dtype=torch.int32)
     for parents in ([-1, 0, 0, 1, 3], [-1, 0, 1, 2, 3], [-1]):
         toks = tokens[:len(parents)]
@@ -107,9 +106,8 @@ def test_stacked_projections_keep_windows_exact():
 
     w = _model()
     qmm_fast.prepare(w, fuse=True)
-    from tensorfold.cuda.rocm import HIP
-
-    assert w.layers[0].gdn.zba is not None and w.layers[0].gdn.zba.layout == ("mlx" if HIP else "tiled")
+    assert w.layers[0].gdn.zba is not None and w.layers[0].gdn.zba.layout == (
+        "groups" if gfx12() else "mlx" if hip() else "tiled")
     tokens = torch.tensor([7, 8, 9, 10], device="cuda", dtype=torch.int32)
     parents = [-1, 0, 0, 1]
     logits, record = tree_forward(w, tokens, parents, State(w))
