@@ -11,7 +11,7 @@ import torch
 import triton
 import triton.language as tl
 
-from tensorfold.cuda.build import hip
+from tensorfold.cuda.build import gfx12, hip
 
 TILE = 64
 CHUNK = 512
@@ -323,7 +323,7 @@ def attention(q: torch.Tensor, k_nodes: torch.Tensor, v_nodes: torch.Tensor, off
     partial_m = torch.empty((p.chunks, w, h), dtype=torch.float32, device=q.device)
     partial_l = torch.empty_like(partial_m)
     tails = 1 + -(-MAX_NODES // CHUNK)
-    if hip() and _rocm_kernel(h, hk, d):
+    if gfx12() and _rocm_kernel(h, hk, d):
         ext = _rocm()
         ext.shared(q, origin, offs, p.streams, p.items, partial_o, partial_m, partial_l, hk,
                    *rocm_launch(-(-w * g // QUERY_TILE), p.chunks), scale)
