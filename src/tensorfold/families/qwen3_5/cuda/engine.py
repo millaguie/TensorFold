@@ -36,18 +36,21 @@ class Qwen27Engine:
         from .exl3_load import admission, quant_config
 
         from .gguf_detect import gguf_file
+        from tensorfold.cuda.build import gfx12, hip
 
         exl3 = quant_config(Path(model_dir)) is not None
         gguf = not exl3 and gguf_file(Path(model_dir)) is not None
         nvfp4 = not exl3 and not gguf and is_quantized(Path(model_dir))
-        if gguf:
-            from tensorfold.cuda.rocm import HIP
-
-            if not HIP:                    # Gufo's kernels are HIP only: say so before building them
-                raise ValueError("GGUF files of Qwen3.8-27B run on AMD GPUs (ROCm, Gufo's kernels); on NVIDIA serve "
-                                 "the MLX checkpoint (Vontra/Qwen3.8-27B-MLX-4bit), an NVFP4 or an EXL3 one")
+        if gguf and not hip():             # Gufo's kernels are HIP only: say so before building them
+            raise ValueError("GGUF files of Qwen3.8-27B run on AMD GPUs (ROCm, Gufo's kernels); on NVIDIA serve "
+                             "the MLX checkpoint (Vontra/Qwen3.8-27B-MLX-4bit), an NVFP4 or an EXL3 one")
         if gguf and tp != 1:
             raise ValueError("GGUF files of Qwen3.8-27B run on one GPU: drop --tp 2")
+        if (exl3 or nvfp4) and hip():
+            raise ValueError(f"{'EXL3 packs' if exl3 else 'NVFP4 checkpoints'} decode with NVIDIA tensor-core kernels; "
+                             "on AMD GPUs serve the MLX checkpoint (Vontra/Qwen3.8-27B-MLX-4bit)")
+        if vision and hip():
+            raise ValueError("image input is untested on AMD GPUs: drop --vision there")
         if (exl3 or nvfp4) and tp != 1:
             raise ValueError(f"{'EXL3 packs' if exl3 else 'NVFP4 checkpoints'} of Qwen3.8-27B run on one GPU: drop "
                              "--tp 2, or serve the MLX checkpoint (Vontra/Qwen3.8-27B-MLX-4bit) on two")
@@ -126,6 +129,12 @@ class Qwen27Engine:
         if tp == 2:
             full = load(model_dir)
             self.w = split_weights(full, rank, tiled=True, split_head=split_head)
+        elif gfx12():                              # RDNA4: [gate|up], [z|b|a] and [k|v] fused, members as views
+            from .qmm_fast import prepare
+
+            full = load(model_dir)
+            prepare(full, fuse=True)
+            self.w = full
         else:
             full = load(model_dir, tiled=True)
             self.w = full

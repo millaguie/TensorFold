@@ -231,7 +231,7 @@ def test_mixed_prefill_tiles_raw_fast_weights_and_preserves_fp8_dispatch():
                  "shared": SimpleNamespace(prefill_matmul8=lambda x, w, **kw: (project(x, w, **kw), "fp8"),
                                            prefill_matmul=lambda x, w, f32=False, tile=None: project(x, w, f32=f32),
                                            prompt_tile=lambda rows, n: 9),     # bf16 rows on the prompt matmul
-                 "QLinear": QLinear}
+                 "QLinear": QLinear, "hip": lambda: False, "gfx12": lambda: False, "groups": SimpleNamespace()}
     module = ast.fix_missing_locations(ast.Module(body=[future, function], type_ignores=[]))
     exec(compile(module, "mixed_prefill_dispatch", "exec"), namespace)
     rows = SimpleNamespace(shape=(4096, 256))

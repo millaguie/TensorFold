@@ -17,15 +17,53 @@ HINT = "if no other build is running, a killed build left it: stop this start, d
 LOCK_WAIT_SECONDS = 60.0        # a start still waiting on the same lock this long says so again
 
 
+
+
+@lru_cache(maxsize=1)
+def hip() -> bool:
+    """Whether torch runs on ROCm: its ``torch.cuda`` then drives an AMD GPU and extensions build with hipcc."""
+
+    try:
+        import torch
+    except ImportError:
+        return False
+    return getattr(torch.version, "hip", None) is not None
+
+
+def hip_arch() -> str:
+    """The AMD GPU's architecture as hipcc names it, e.g. ``gfx1201`` (feature suffixes dropped); without a visible
+    GPU, the first of ``PYTORCH_ROCM_ARCH`` (a build-only host)."""
+
+    import torch
+
+    if not torch.cuda.is_available() and os.environ.get("PYTORCH_ROCM_ARCH"):
+        return os.environ["PYTORCH_ROCM_ARCH"].replace(",", ";").split(";")[0].strip()
+    return torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
+
+
+def gfx12() -> bool:
+    """An RDNA4 GPU (gfx12xx): the WMMA kernels and the FP8 paths are written and checked for it alone."""
+
+    return hip() and hip_arch().startswith("gfx12")
+
+
+def device_flags(flags: list[str]) -> list[str]:
+    """``flags`` as the device compiler takes them: nvcc's as given, or their hipcc equivalents on ROCm."""
+
+    if not hip():
+        return list(flags)
+    from .rocm import hip_flags
+
+    return hip_flags(flags)
+
+
 def arch_flags(need: tuple[int, int] = MIN_CAPABILITY, arch_specific: bool = False) -> list[str]:
     """nvcc flags for this GPU alone (``arch_specific``: its ``a`` target); a GPU under ``need`` is refused by name."""
 
     import torch
 
-    from .rocm import HIP, offload_arch
-
-    if HIP:                                         # hipcc: one AMD target; the portable paths avoid clusters and FP8 MMA
-        return [f"--offload-arch={offload_arch()}"]
+    if hip():                                       # hipcc: one AMD target; the portable paths avoid clusters and FP8 MMA
+        return [f"--offload-arch={hip_arch()}"]
     major, minor = torch.cuda.get_device_capability()
     if (major, minor) < need:
         why = "thread-block clusters" if need >= CLUSTERS else "FP8 MMA"
@@ -54,14 +92,14 @@ def load(name: str, sources: str | list[str], need: tuple[int, int] = MIN_CAPABI
          **kwargs: Any) -> Any:
     """torch's JIT ``load`` for this GPU only (NVIDIA's containers list every architecture back to sm_80), with a line when it compiles or waits on a lock."""
 
-    from .rocm import HIP, hip_flags, use_pip_sdk
+    from .rocm import use_pip_sdk
 
-    if HIP:
+    if hip():
         use_pip_sdk()
     from torch.utils import cpp_extension
 
     flags = kwargs.get("extra_cuda_cflags", [])
-    kwargs["extra_cuda_cflags"] = [*(hip_flags(flags) if HIP else flags), *arch_flags(need, arch_specific)]
+    kwargs["extra_cuda_cflags"] = [*device_flags(flags), *arch_flags(need, arch_specific)]
     links = _toolkit()
     if links:
         kwargs["extra_ldflags"] = [*kwargs.get("extra_ldflags", []), *links]
@@ -189,4 +227,5 @@ def _say(text: str) -> None:
     print(f"[tensorfold] {text}", flush=True)
 
 
-__all__ = ["CLUSTERS", "MIN_CAPABILITY", "arch_flags", "load", "pip_toolkit"]
+__all__ = ["CLUSTERS", "MIN_CAPABILITY", "arch_flags", "device_flags", "gfx12", "hip", "hip_arch", "load",
+           "pip_toolkit"]

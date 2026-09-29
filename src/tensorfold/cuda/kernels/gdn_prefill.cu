@@ -18,6 +18,8 @@
 #define TF_KERNEL_PTR(k) (k)
 #endif
 
+#include <cstdlib>
+
 namespace {
 
 constexpr int DK = 128;
@@ -170,9 +172,28 @@ void launch(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v, const
 
 } // namespace
 
-// Fewer heads than SMs: a block takes 64 value rows, not 128, so the chunk still fills the GPU.
+// Fewer heads than SMs: a block takes 64 value rows, not 128, so the chunk still fills the GPU. ROCm: 64 rows a block
+// (TF_ROCM_CHAIN_ROWS: 32, 64 or 128), since its reported count is not the CUs the heads must fill (64 led on an R9700,
+// 18% under 128); a row's arithmetic is the same at any of them.
 void gdn_prefill_cuda(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v, const at::Tensor& g,
                       const at::Tensor& beta, const at::Tensor& state, at::Tensor& last, at::Tensor& y, int sms) {
+#ifdef __HIPCC__
+    static const int rows = [] {
+        const char* env = std::getenv("TF_ROCM_CHAIN_ROWS");
+        const int r = env != nullptr ? std::atoi(env) : 64;
+        return r == 32 || r == 128 ? r : 64;
+    }();
+    if (q.scalar_type() == at::kFloat) {
+        if (rows == 128) launch<float, 128>(q, k, v, g, beta, state, last, y);
+        else if (rows == 64) launch<float, 64>(q, k, v, g, beta, state, last, y);
+        else launch<float, 32>(q, k, v, g, beta, state, last, y);
+    } else {
+        if (rows == 128) launch<__nv_bfloat16, 128>(q, k, v, g, beta, state, last, y);
+        else if (rows == 64) launch<__nv_bfloat16, 64>(q, k, v, g, beta, state, last, y);
+        else launch<__nv_bfloat16, 32>(q, k, v, g, beta, state, last, y);
+    }
+    return;
+#endif
     const bool wide = v.size(1) >= sms;
     if (q.scalar_type() == at::kFloat) {
         if (wide) launch<float, 128>(q, k, v, g, beta, state, last, y);
