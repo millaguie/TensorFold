@@ -83,10 +83,13 @@ def attention(q: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor, p0:
     w, h, d = q.shape
     hk = _check(q, k_cache, v_cache, p0)
     out = torch.empty_like(q)
+    if gfx12() and _rocm_kernel(h, hk, d):           # bf16 caches, or packed FP8 rows (uint8, ``kv8.ROW8``)
+        _rocm().attention(q, k_cache, v_cache, out, p0, scale, *rocm_rows(w))
+        return out
+    if k_cache.dtype == torch.uint8:
+        raise ValueError("packed FP8 key/value caches need ROCm's WMMA prompt attention on RDNA4 (head size 256, "
+                         "without TF_ROCM_ATTN_KERNEL=triton)")
     if gfx12():                            # RDNA4: the schedules measured on the R9700
-        if _rocm_kernel(h, hk, d):
-            _rocm().attention(q, k_cache, v_cache, out, p0, scale, *rocm_rows(w))
-            return out
         return _rocm_attention(q, k_cache, v_cache, out, p0, scale)
     if d == 64 or hip():                   # other ROCm GPUs: the CUDA kernel is inline PTX; the Triton definition runs
         return triton_attention(q, k_cache, v_cache, p0, scale=scale, out=out)

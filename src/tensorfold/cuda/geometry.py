@@ -129,6 +129,12 @@ def kv_bytes(head_dim: int, bits: int = 16) -> int:
     return head_dim * bits // 8 + head_dim // 32 * 2
 
 
+def kv8_bytes(head_dim: int) -> int:
+    """One position's keys (or values) for one KV head as packed FP8 rows (``kv8``: 272 bytes a 256 values)."""
+
+    return head_dim * 272 // 256
+
+
 def layer_counts(t: dict) -> tuple[int, int]:
     if "layer_types" in t:
         linear = sum(kind == "linear_attention" for kind in t["layer_types"])
@@ -149,17 +155,21 @@ def prompt_rows(total: int, row_bytes: int, most: int = 4096) -> int:
     return max(512, min(most, total // PROMPT_SHARE // row_bytes // 512 * 512))
 
 
-def live_kv(t: dict, world: int, window: int) -> int:
-    """A dense stream's attention caches at ``window`` rows (1,024 at least) and one layer's buffer mid-grow."""
+def live_kv(t: dict, world: int, window: int, *, kv8: bool = False) -> int:
+    """A dense stream's attention caches at ``window`` rows (1,024 at least) and one layer's buffer mid-grow
+    (``kv8``: packed FP8 rows)."""
 
     _, attention = layer_counts(t)
-    return (attention + 1) * max(1024, window) * int(t["num_key_value_heads"]) // world * int(t["head_dim"]) * 4
+    hd = int(t["head_dim"])
+    row = 2 * (kv8_bytes(hd) if kv8 else kv_bytes(hd))
+    return (attention + 1) * max(1024, window) * int(t["num_key_value_heads"]) // world * row
 
 
 def gdn_geometry(t: dict, world: int, reserve: int, *, indexed: bool = False, mtp: bool = False,
                  kv_bits: int = 16, rows: int | None = None, prompt: int = 0, evicts: bool = False,
-                 kept: int = 2, prefill_rows: int = PREFILL_ROWS) -> Geometry:
-    """``rows``: widest verify; ``prompt``: chunk rows sharing its scratch; ``evicts``: only the live window counts."""
+                 kept: int = 2, prefill_rows: int = PREFILL_ROWS, kv8: bool = False) -> Geometry:
+    """``rows``: widest verify; ``prompt``: chunk rows sharing its scratch; ``evicts``: only the live window counts;
+    ``kv8``: the attention caches hold packed FP8 rows (the 27B's ``--kv-dtype fp8``), else bf16."""
 
     linear, attention = layer_counts(t)
     d, h = int(t["hidden_size"]), int(t["num_attention_heads"]) // world
@@ -203,7 +213,8 @@ def gdn_geometry(t: dict, world: int, reserve: int, *, indexed: bool = False, mt
         else:
             # Bound two retained prefixes, current KV state and a growth copy; speculative rows use separate workspace.
             rounded = 1 << (max(1024, capacity - reserve) - 1).bit_length()
-            cache = live_kv(t, world, capacity - reserve) if evicts else 4 * attention * rounded * hk * hd * 4
+            cache = live_kv(t, world, capacity - reserve, kv8=kv8) if evicts else \
+                4 * attention * rounded * hk * 2 * (kv8_bytes(hd) if kv8 else kv_bytes(hd))
             scratch = rows * h * (hd + 2) * ((capacity + 511) // 512) * 4
         return fixed + cache + scratch
     return Geometry(bytes_at, reserve)
@@ -377,8 +388,10 @@ def _gdn_dims(t: dict, world: int) -> tuple:
             nk, nv, dk, dv, 2 * nk * dk + 2 * nv * dv + 2 * nv)
 
 
-def stream_geometry(t: dict, world: int, streams: int, keep: int, *, first: int | None = None) -> Geometry:
-    """The 27B's concurrent decoder: live streams, ``keep`` kept prompt ends, windows; ``first``: growth on one GPU."""
+def stream_geometry(t: dict, world: int, streams: int, keep: int, *, first: int | None = None,
+                    kv8: bool = False) -> Geometry:
+    """The 27B's concurrent decoder: live streams, ``keep`` kept prompt ends, windows; ``first``: growth on one GPU;
+    ``kv8``: packed FP8 attention caches."""
 
     linear, attention = layer_counts(t)
     d, h, hk, hd, nk, nv, dk, dv, width = _gdn_dims(t, world)
@@ -391,9 +404,10 @@ def stream_geometry(t: dict, world: int, streams: int, keep: int, *, first: int 
     extent = d + int(t["vocab_size"]) // world + slots * (intermediate + d) + width + h * hd
     fixed += 16 * max(128, rows) * extent * 4 + 32 * rows * 2560 * 4
     def bytes_at(capacity: int) -> int:
-        kv = attention * capacity * hk * hd * 2 * 2
+        row = hk * 2 * (kv8_bytes(hd) if kv8 else kv_bytes(hd))         # one position's keys and values, a layer
+        kv = attention * capacity * row
         caches = (streams + keep + 1) * kv if first is None else \
-            kv + (streams + keep) * attention * min(first, capacity) * hk * hd * 2 * 2
+            kv + (streams + keep) * attention * min(first, capacity) * row
         scratch = rows * h * (hd + 2) * ((capacity + 511) // 512) * 4
         return fixed + caches + kv // max(1, attention) + scratch   # one layer's growth copy
     return Geometry(bytes_at, 1)

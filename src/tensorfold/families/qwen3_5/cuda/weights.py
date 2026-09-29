@@ -308,6 +308,7 @@ class Weights:
     inv_freq: torch.Tensor | None = None             # (rope_dims/2,) fp32
     quant: str = "mlx"                               # "exl3": an EXL3 pack (prompt glue then stays in bf16); "nvfp4"; "gguf"
     prompt_rows: int = 4096                          # a prompt chunk's rows, sized to the GPU: any count, the same bits
+    kv_fp8: bool = False                             # attention caches of packed FP8 rows (``kv8``; ROCm)
 
     @cached_property
     def fast_prefill(self) -> bool:

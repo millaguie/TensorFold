@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import time
 from pathlib import Path
 from typing import Callable, Sequence
@@ -28,7 +29,8 @@ class Qwen27Engine:
                  rank: int = 0, master: str = "", port: int = 29551, split_head: bool = False,
                  tp_draft: bool = False, allow_copy: bool = True, streams: int = 1,
                  context: int | None = None, context_explicit: bool | None = None, vision: bool = False,
-                 vision_urls: bool = False, tree_rows: int | None = None, keep: int | None = None):
+                 vision_urls: bool = False, tree_rows: int | None = None, keep: int | None = None,
+                 kv_fp8: bool = False):
         import torch
 
         from tensorfold.cuda.nvfp4.format import is_quantized
@@ -57,6 +59,21 @@ class Qwen27Engine:
         if nvfp4 and vision:
             raise ValueError("image input on CUDA is tested on the MLX checkpoint only: drop --vision for an NVFP4 "
                              "checkpoint, or serve Vontra/Qwen3.8-27B-MLX-4bit")
+        if kv_fp8:                          # packed FP8 keys and values: only ROCm's WMMA attention reads them
+            if not gfx12():
+                raise ValueError("--kv-dtype fp8: FP8 keys and values run on ROCm's WMMA attention, written for RDNA4 "
+                                 "(gfx12); other GPUs serve bf16")
+            if tp != 1:
+                raise ValueError("--kv-dtype fp8 runs on one GPU: drop --tp 2")
+            for name in ("TF_ROCM_ATTN_KERNEL", "TF_ROCM_TREE_KERNEL"):
+                if os.environ.get(name) == "triton":
+                    raise ValueError(f"--kv-dtype fp8: {name}=triton attention reads bf16 caches; unset it")
+            from tensorfold.cuda.capacity import config
+
+            text = config(model_dir)
+            dim = int(text.get("head_dim") or int(text["hidden_size"]) // int(text["num_attention_heads"]))
+            if dim != 256:
+                raise ValueError(f"--kv-dtype fp8 packs rows of 256 values for the WMMA kernels, not head size {dim}")
         from .weights import load
         from tensorfold.cuda.capacity import admit, config, gather_ints, total_bytes
         from tensorfold.cuda.geometry import (draft_geometry, gdn_geometry, live_kv, prompt_row_bytes, prompt_rows,
@@ -99,8 +116,10 @@ class Qwen27Engine:
         many = streams > 1
         # prompt chunks sized to the card (4096 rows from 80 GB), the verify scratch to the rows a round takes
         chunk = prompt_rows(total_bytes(torch), prompt_row_bytes(config(model_dir), tp))
-        geometry = ((lambda text: stream_geometry(text, tp, streams, keep, first=256 if tp == 1 else None)) if many
-                    else (lambda text: gdn_geometry(text, tp, max_rows, rows=max_rows, prompt=chunk, evicts=tp == 1)))
+        geometry = ((lambda text: stream_geometry(text, tp, streams, keep, first=256 if tp == 1 else None,
+                                                  kv8=kv_fp8)) if many
+                    else (lambda text: gdn_geometry(text, tp, max_rows, rows=max_rows, prompt=chunk, evicts=tp == 1,
+                                                    kv8=kv_fp8)))
         # an affine checkpoint's packed words at their stored precision; an EXL3 pack's by its own format
         tensor_bytes = weight_transform(model_dir, one_gpu=tp == 1)
         if gguf:
@@ -139,12 +158,14 @@ class Qwen27Engine:
             full = load(model_dir, tiled=True)
             self.w = full
         self.w.prompt_rows = chunk
-        from tensorfold.cuda.rocm import HIP
-
-        if HIP:                                     # one decode kernel a run: drafted and draft-off requests share it
+        if hip() and not gfx12():                   # one decode kernel a run: drafted and draft-off requests share it
             from .qgemv import configure
 
             configure(draft_dir is not None)
+        if kv_fp8:                                 # before any State: attention caches of packed rows (``kv8``)
+            self.w.kv_fp8 = True
+            print("[tensorfold] FP8 keys and values: e4m3 with a power-of-two scale per row, about half of bf16's "
+                  "cache bytes", flush=True)
         self.draft = None
         if draft_dir is not None and (rank == 0 or (tp == 2 and tp_draft)):
             from .dflash2 import DFlash2
@@ -169,7 +190,7 @@ class Qwen27Engine:
 
             plan = self.capacity_plan
             spare = plan["budget_bytes"] - plan["weight_bytes_estimate"] - plan["cache_workspace_bytes_estimate"]
-            self.room = KVRoom(self.cache, spare + live_kv(config(model_dir), 1, self.context_window))
+            self.room = KVRoom(self.cache, spare + live_kv(config(model_dir), 1, self.context_window, kv8=kv_fp8))
         # ``streams`` > 1: up to that many requests decoded together, their windows verified in one forward
         self.concurrent = streams > 1
         self.multi = self.scheduler = None
