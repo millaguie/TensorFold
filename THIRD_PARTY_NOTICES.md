@@ -117,3 +117,23 @@ The multimodal rotary and image-feature integration is adapted from MiaAI-Lab's
 [Flash Next vision patch 0008](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold/blob/a3aa89835022c55ca8e55008c37785954834e04f/patches/0008-flash-next-vision.patch),
 MIT License, Copyright (c) 2026 MiaAI-Lab. The license is included in `LICENSES/MiaAI-Lab-MIT.txt`.
 The port preserves the v0.5 CUDA execution APIs and adds an offline EXL3 vision adapter.
+
+## AMD GPUs (ROCm)
+
+This fork's ROCm support for Qwen3.8-27B (branch `rocm-r9700` of github.com/millaguie/TensorFold) merges two ports
+of the CUDA engine and adds to them:
+
+- ThinkOffApp's Strix Halo port (gfx1151), PR [ashhart/TensorFold#144](https://github.com/ashhart/TensorFold/pull/144):
+  `tensorfold.cuda.rocm`, the `qgemv` row-invariant decode kernel, the Triton lane matmul for prompts, `SPLIT_V` in
+  the Triton prompt attention, `top_by_value_then_id`, and the GGUF path. Its GGUF kernels vendor
+  [Gufo](https://github.com/ThinkOffApp/gufo) under the MIT License, kept with its notice in
+  `src/tensorfold/cuda/gguf/vendor/`.
+- jkuepker's Radeon AI PRO R9700 port (gfx1201), PR [ashhart/TensorFold#100](https://github.com/ashhart/TensorFold/pull/100):
+  the WMMA decode matmul (`cuda/kernels/qmm_rocm.cu`, `qmm_groups.py`), the WMMA prompt and tree attention
+  (`cuda/kernels/attention_rocm.cu`), the Triton FP8 prompt GEMM, the stacked projections, the DFlash2 block
+  attention in parts and `--kv-dtype fp8` (`cuda/kernels/kv8.py`).
+- `cuda/kernels/qmm8_rocm.cu` (the hand-written fp8 WMMA prompt GEMM) is written for this fork on top of both. Its
+  design takes ideas, not code, from [vLLM-radiance](https://codeberg.org/StillDeadcode/vllm-radiance)
+  (`radiance_mxfp4_fp8.hip`, mirrored at github.com/magiccodingman/vllm-radiance): issuing the fp8 WMMA by hand,
+  staging operands through LDS and padding LDS rows against bank conflicts. That repository carries no license, so
+  none of its code is used.
