@@ -324,7 +324,7 @@ class Weights:
             modules = [m for m in (layer.gate, layer.up, layer.down) if m is not None]    # a MoE layer's are None
             modules += [layer.gdn.qkv, layer.gdn.z, layer.gdn.b, layer.gdn.a, layer.gdn.out] if layer.gdn else []
             modules += [layer.attn.q, layer.attn.k, layer.attn.v, layer.attn.o] if layer.attn else []
-            if self.quant == "nvfp4":                # NVFP4 and FP8 have one; bf16 gates only with their e4m3 copies
+            if self.quant in ("nvfp4", "mx4"):       # their own prefill8 or none (bf16 prompts)
                 if any(not hasattr(q, "prefill8") for q in modules):
                     return False
             elif any(not q.fast for q in modules):
@@ -379,6 +379,10 @@ def load(model_dir: str | Path, device: str = "cuda", *, tiled: bool = False, ml
         return load_exl3(model_dir, device)
     if quantized(model_dir):
         return load_nvfp4(model_dir, device)
+    from .mx4_load import load_mx4, quark_mxfp4
+
+    if quark_mxfp4(model_dir):
+        return load_mx4(model_dir, device)
     cfg = Config.read(model_dir)
     raw = json.loads((model_dir / "config.json").read_text())
     t = _Tensors(model_dir, device)
