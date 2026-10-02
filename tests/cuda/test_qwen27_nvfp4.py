@@ -17,6 +17,8 @@ import torch
 
 if not torch.cuda.is_available():
     pytest.skip("CUDA only", allow_module_level=True)
+if getattr(torch.version, "hip", None):
+    pytest.skip("NVFP4 checkpoints decode with NVIDIA tensor-core kernels; ROCm refuses them at startup", allow_module_level=True)
 
 from tensorfold.cuda.nvfp4.linear import Fp4Linear, Fp8Linear
 from tensorfold.families.qwen3_5.cuda.dflash2 import _sub_parts
