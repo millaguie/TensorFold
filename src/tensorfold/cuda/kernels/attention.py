@@ -196,7 +196,7 @@ def _rocm():
     from tensorfold.cuda.build import load
 
     here = Path(__file__).parent                        # prompt and tree attention: one extension
-    return load(name="tensorfold_attention_rocm_v10",
+    return load(name="tensorfold_attention_rocm_v12",
                 sources=[str(here / "attention_rocm.cpp"), str(here / "attention_rocm.cu")],
                 extra_cuda_cflags=["-O3"], verbose=False)
 
