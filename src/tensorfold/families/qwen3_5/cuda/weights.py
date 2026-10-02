@@ -116,9 +116,9 @@ def _fast() -> bool:
     """On ROCm by default: GGUF projections on Gufo's production routes (speed first, see ``Gguf``).
     TENSORFOLD_GGUF_FAST=0 keeps every row count on the exact kernel (decode's bits for prompts too)."""
 
-    from tensorfold.cuda.rocm import HIP
+    from tensorfold.cuda.build import hip
 
-    return HIP and os.environ.get("TENSORFOLD_GGUF_FAST", "1") != "0"
+    return hip() and os.environ.get("TENSORFOLD_GGUF_FAST", "1") != "0"
 
 
 @dataclass
