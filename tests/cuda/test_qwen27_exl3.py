@@ -18,6 +18,8 @@ import torch
 
 if not torch.cuda.is_available():
     pytest.skip("CUDA only", allow_module_level=True)
+if getattr(torch.version, "hip", None):
+    pytest.skip("EXL3 packs decode with NVIDIA tensor-core kernels; ROCm refuses them at startup", allow_module_level=True)
 
 from tensorfold.cuda.exl3.linear import Exl3Linear
 from tensorfold.families.qwen3_5.cuda.decode import draft_decode, serial_decode
