@@ -444,10 +444,25 @@ def prefill8_kernel() -> str:
 
 
 @lru_cache(maxsize=1)
-def prefill8_variant() -> int:
-    """``qmm8_rocm.cu``'s tiling (``TF_ROCM_PREFILL8_VARIANT``): scheduling only, never bits."""
+def prefill8_variant() -> int | None:
+    """``qmm8_rocm.cu``'s tiling, fixed by ``TF_ROCM_PREFILL8_VARIANT``; unset, ``variant_for`` picks one a call.
+    Scheduling only: every variant gives every output the same bits (checked equal at the 27B's shapes)."""
 
-    return int(os.environ.get("TF_ROCM_PREFILL8_VARIANT", "0"))
+    v = os.environ.get("TF_ROCM_PREFILL8_VARIANT")
+    return None if v is None else int(v)
+
+
+def variant_for(m: int, n: int) -> int:
+    """The fastest tiling measured on an R9700 (gfx1201, M = 7 to 4096 at the 27B's shapes): 256 x 128 tiles widening
+    the 4-bit words in the kernel from 768 rows (12), 128 x 64 tiles for the GDN gates' 48 columns (14), else 128 x
+    128 tiles on the words (10). All three skip _nibbles8's pass."""
+
+    fixed = prefill8_variant()
+    if fixed is not None:
+        return fixed
+    if n <= 64:
+        return 14
+    return 12 if m >= 768 else 10
 
 
 @lru_cache(maxsize=1)
@@ -455,7 +470,7 @@ def _ext8():
     from tensorfold.cuda.build import load
 
     here = Path(__file__).parent
-    return load(name="tensorfold_qmm8_rocm_v7", sources=[str(here / "qmm8_rocm.cpp"), str(here / "qmm8_rocm.cu")],
+    return load(name="tensorfold_qmm8_rocm_v9", sources=[str(here / "qmm8_rocm.cpp"), str(here / "qmm8_rocm.cu")],
                 extra_cuda_cflags=["-O3", "--fmad=false"], verbose=False)
 
 
@@ -492,11 +507,16 @@ def prefill_matmul8(x: tuple[torch.Tensor, torch.Tensor, torch.Tensor], words: t
     if x8.dtype != torch.uint8 or x8.dim() != 2 or x8.shape[1] != k or xs.shape != (x8.shape[0], kg):
         raise ValueError(f"prefill matmul8: e4m3 rows (M, {k}) with (M, {kg}) group sums")
     m = x8.shape[0]
+    out = torch.empty((m, n), dtype=torch.float32 if f32 else torch.bfloat16, device=x8.device)
+    hip = prefill8_kernel() == "hip"
+    variant = variant_for(m, n) if hip else 0
+    if hip and variant >= 10:                         # the kernel widens the words itself: no _nibbles8 pass
+        _ext8().gemm8(x8, xs, a, words.contiguous(), scales, biases, n, prefill8_group(), out, variant)
+        return out
     w8 = _buffer(words.device, n * k).view(n, k)
     _nibbles8[(kg, triton.cdiv(n, 64))](words, w8, N=n, K=k, BLOCK_N=64, num_warps=4)
-    out = torch.empty((m, n), dtype=torch.float32 if f32 else torch.bfloat16, device=x8.device)
-    if prefill8_kernel() == "hip":                    # the hand-issued fp8 WMMA (qmm8_rocm.cu); its own bits
-        _ext8().gemm8(x8, xs, a, w8, scales, biases, n, prefill8_group(), out, prefill8_variant())
+    if hip:                                           # the hand-issued fp8 WMMA (qmm8_rocm.cu); its own bits
+        _ext8().gemm8(x8, xs, a, w8, scales, biases, n, prefill8_group(), out, variant)
         return out
     bm, bn, warps, stages = prefill8_config()
     _gemm8[(triton.cdiv(m, bm) * triton.cdiv(n, bn),)](x8, xs, a, w8, scales, biases, out, m, N=n, K=k, BM=bm, BN=bn,
