@@ -297,6 +297,200 @@ void launch(const at::Tensor& x8, const at::Tensor& xs, const at::Tensor& a, con
         out.scalar_type() == at::kFloat);
 }
 
+// ------------------------------------------------------------------------------------------------- tiled activations
+// The prompt rows arrive in WMMA fragment order (prefill_glue.py with TILED: 16 rows x 16 positions a 256-byte
+// fragment, lane l's 8 bytes at 8 l), so each lane loads its A fragment straight from global memory into the register
+// the WMMA reads, and only the weights go through LDS. Ideas from radiance's A-tiled prefill kernel (its notes measure
+// staging A through LDS at a quarter of the run time): fragment-ordered activations, wave-uniform bases in scalar
+// registers with 32-bit lane offsets, LDS-only barriers, a 256-row tile. The products, their order and the epilogue
+// are the staged kernel's, so are the bits.
+__device__ __forceinline__ void lds_fence_barrier() {
+    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup", "local");
+    __builtin_amdgcn_s_barrier();
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup", "local");
+}
+
+// TN 16-column fragments a wave (BN = 32 TN), GPS groups a slab, SEQ: one partial sum live at a time.
+template <int TN, int GPS, bool SEQ>
+__global__ void __launch_bounds__(256) gemm8_tiled_kernel(
+        const uint8_t* __restrict__ x8t, const unsigned short* __restrict__ xs, const float* __restrict__ a,
+        const unsigned* __restrict__ words, const unsigned short* __restrict__ scales,
+        const unsigned short* __restrict__ biases, int m, int n, int k, void* __restrict__ out, bool f32) {
+    constexpr int WN = 2, TM = 4, BM = 256, BN = WN * TN * 16;
+    constexpr int LBK = GPS * GK, NS = LBK / 16, PITCH = LBK + 8;
+    constexpr int PIECES = BN * GPS * 2, P = (PIECES + 255) / 256;   // 16-byte word pieces a slab, a thread
+    __shared__ uint8_t wl[BN * PITCH];
+    const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5;
+    const int wm = wave / WN, wn = wave % WN;
+    const int h = lane >> 4, c = lane & 15;
+    const int kg = k / GK, ksteps = k / 16, mt_last = (m + 15) / 16 - 1;
+    const int row0 = blockIdx.y * BM, col0 = blockIdx.x * BN;
+    const int wr = wm * TM * 16, wc = wn * TN * 16;
+
+    const uint8_t* abase[TM];                            // a wave's fragment rows: uniform, in scalar registers
+#pragma unroll
+    for (int i = 0; i < TM; ++i) {
+        const int mt = min(row0 / 16 + wm * TM + i, mt_last);   // past m: the last tile again (outputs dropped)
+        abase[i] = x8t + __builtin_amdgcn_readfirstlane(mt * ksteps * 256);
+    }
+    const unsigned aoff = lane * 8;
+    int colc[TN];
+#pragma unroll
+    for (int u = 0; u < TN; ++u) colc[u] = min(col0 + wc + 16 * u + c, n - 1);
+
+    float8 acc[TM][TN];
+#pragma unroll
+    for (int t = 0; t < TM; ++t)
+#pragma unroll
+        for (int u = 0; u < TN; ++u) acc[t][u] = float8{0, 0, 0, 0, 0, 0, 0, 0};
+
+    const int stages = (kg + GPS - 1) / GPS;
+    for (int st = 0; st < stages; ++st) {
+        // the weights first: staging waits on them alone (the load counter is in order), the A fragments land later
+        uint4 wv[P];
+#pragma unroll
+        for (int it = 0; it < P; ++it) {
+            const int q = min(tid + it * 256, PIECES - 1);
+            const int j = q / (BN * 2), r = q % (BN * 2);
+            const int g = min(st * GPS + j, kg - 1), col = min(col0 + (r >> 1), n - 1);
+            wv[it] = *reinterpret_cast<const uint4*>(words + tile_at(g, kg, col) * 8 + 4 * (r & 1));
+        }
+        int2v af[TM][NS];
+#pragma unroll
+        for (int i = 0; i < TM; ++i)
+#pragma unroll
+            for (int s = 0; s < NS; ++s) {
+                const unsigned ks = min(st * NS + s, ksteps - 1);
+                af[i][s] = *reinterpret_cast<const int2v*>(abase[i] + (aoff + ks * 256u));
+            }
+        unsigned short sc16[GPS][TN];
+#pragma unroll
+        for (int j = 0; j < GPS; ++j)
+#pragma unroll
+            for (int u = 0; u < TN; ++u) sc16[j][u] = scales[tile_at(min(st * GPS + j, kg - 1), kg, colc[u])];
+        lds_fence_barrier();                             // the last slab's weight reads are done
+#pragma unroll
+        for (int it = 0; it < P; ++it) {
+            const int q = tid + it * 256;
+            if (q < PIECES) {
+                const int j = q / (BN * 2), r = q % (BN * 2);
+                const uint4 b0 = codes16(wv[it].x, wv[it].y), b1 = codes16(wv[it].z, wv[it].w);
+                uint2* dst = reinterpret_cast<uint2*>(wl + (r >> 1) * PITCH + j * GK + 32 * (r & 1));
+                dst[0] = make_uint2(b0.x, b0.y);
+                dst[1] = make_uint2(b0.z, b0.w);
+                dst[2] = make_uint2(b1.x, b1.y);
+                dst[3] = make_uint2(b1.z, b1.w);
+            }
+        }
+        lds_fence_barrier();                             // staged
+#pragma unroll
+        for (int j = 0; j < GPS; ++j) {
+            if (st * GPS + j >= kg) break;
+            int2v bf[GK / 16][TN];
+#pragma unroll
+            for (int s = 0; s < GK / 16; ++s)
+#pragma unroll
+                for (int u = 0; u < TN; ++u) {
+                    const uint2 v = *reinterpret_cast<const uint2*>(wl + (wc + 16 * u + c) * PITCH + j * GK + 16 * s + 8 * h);
+                    bf[s][u] = int2v{static_cast<int>(v.x), static_cast<int>(v.y)};
+                }
+            __builtin_amdgcn_sched_barrier(0);
+            if constexpr (SEQ) {
+#pragma unroll
+                for (int u = 0; u < TN; ++u) {
+                    const float sc = bf16_value(sc16[j][u]);
+#pragma unroll
+                    for (int t = 0; t < TM; ++t) {
+                        float8 p = float8{0, 0, 0, 0, 0, 0, 0, 0};
+#pragma unroll
+                        for (int s = 0; s < GK / 16; ++s)
+                            p = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(af[t][j * 4 + s], bf[s][u], p);
+#pragma unroll
+                        for (int e = 0; e < 8; ++e) acc[t][u][e] = fmaf(p[e], sc, acc[t][u][e]);
+                    }
+                }
+            } else {
+                float8 p[TM][TN];
+#pragma unroll
+                for (int t = 0; t < TM; ++t)
+#pragma unroll
+                    for (int u = 0; u < TN; ++u) p[t][u] = float8{0, 0, 0, 0, 0, 0, 0, 0};
+#pragma unroll
+                for (int s = 0; s < GK / 16; ++s)
+#pragma unroll
+                    for (int t = 0; t < TM; ++t)
+#pragma unroll
+                        for (int u = 0; u < TN; ++u)
+                            p[t][u] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(af[t][j * 4 + s], bf[s][u],
+                                                                                           p[t][u]);
+#pragma unroll
+                for (int u = 0; u < TN; ++u) {
+                    const float sc = bf16_value(sc16[j][u]);
+#pragma unroll
+                    for (int t = 0; t < TM; ++t)
+#pragma unroll
+                        for (int e = 0; e < 8; ++e) acc[t][u][e] = fmaf(p[t][u][e], sc, acc[t][u][e]);
+                }
+            }
+        }
+    }
+    // the bias on the group sums, as the staged kernel
+    for (int g0 = 0; g0 < kg; g0 += 16) {
+        short8 bx[TN];
+#pragma unroll
+        for (int u = 0; u < TN; ++u) {
+            const int col = col0 + wc + 16 * u + c;
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const int g = g0 + 8 * h + j;
+                bx[u][j] = col < n && g < kg ? static_cast<short>(biases[tile_at(g, kg, col)]) : short(0);
+            }
+        }
+#pragma unroll
+        for (int t = 0; t < TM; ++t) {
+            const int row = row0 + wr + 16 * t + c;
+            short8 ax;
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const int g = g0 + 8 * h + j;
+                ax[j] = row < m && g < kg ? static_cast<short>(xs[static_cast<size_t>(row) * kg + g]) : short(0);
+            }
+#pragma unroll
+            for (int u = 0; u < TN; ++u)
+                acc[t][u] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(ax, bx[u], acc[t][u]);
+        }
+    }
+#pragma unroll
+    for (int t = 0; t < TM; ++t)
+#pragma unroll
+        for (int e = 0; e < 8; ++e) {
+            const int row = row0 + wr + 16 * t + 8 * h + e;
+            if (row >= m) break;
+            const float scale = a[row];
+#pragma unroll
+            for (int u = 0; u < TN; ++u) {
+                const int col = col0 + wc + 16 * u + c;
+                if (col >= n) continue;
+                const size_t at = static_cast<size_t>(row) * n + col;
+                const float v = acc[t][u][e] * scale;
+                if (f32) static_cast<float*>(out)[at] = v;
+                else static_cast<unsigned short*>(out)[at] = bf16_round(v);
+            }
+        }
+}
+
+template <int TN, int GPS, bool SEQ>
+void launch_tiled(const at::Tensor& x8, const at::Tensor& xs, const at::Tensor& a, const at::Tensor& words,
+                  const at::Tensor& scales, const at::Tensor& biases, int m, int n, int k, at::Tensor& out) {
+    constexpr int BN = 32 * TN;
+    const dim3 grid((n + BN - 1) / BN, (m + 255) / 256);
+    gemm8_tiled_kernel<TN, GPS, SEQ><<<grid, 256, 0, at::cuda::getCurrentCUDAStream()>>>(
+        x8.data_ptr<uint8_t>(), reinterpret_cast<const unsigned short*>(xs.data_ptr()), a.data_ptr<float>(),
+        reinterpret_cast<const unsigned*>(words.data_ptr()), reinterpret_cast<const unsigned short*>(scales.data_ptr()),
+        reinterpret_cast<const unsigned short*>(biases.data_ptr()), m, n, k, out.data_ptr(),
+        out.scalar_type() == at::kFloat);
+}
+
 }  // namespace
 
 // variant: the tiling (speed only, never bits); 0 is the default
@@ -324,5 +518,27 @@ void gemm8(const at::Tensor& x8, const at::Tensor& xs, const at::Tensor& a, cons
         case 13: launch<256, 128, 4, 4, 1, 2, true, true>(x8, xs, a, w8, scales, biases, m, n, k, group, out); break;
         case 14: launch<128, 64, 2, 2, 1, 2, false, true>(x8, xs, a, w8, scales, biases, m, n, k, group, out); break;
         default: TORCH_CHECK(false, "gemm8: unknown variant");
+    }
+}
+
+// x8: (row tiles, K / 16, 256) e4m3 fragments (prefill_glue's TILED rows); words: group-major 4-bit words.
+void gemm8_tiled(const at::Tensor& x8, const at::Tensor& xs, const at::Tensor& a, const at::Tensor& words,
+                 const at::Tensor& scales, const at::Tensor& biases, int n, at::Tensor& out, int variant) {
+    const int m = static_cast<int>(xs.size(0)), k = static_cast<int>(x8.size(1)) * 16;
+    TORCH_CHECK(x8.dim() == 3 && x8.size(2) == 256 && x8.size(0) == (m + 15) / 16 && k % GK == 0 &&
+                xs.size(1) == k / GK && words.scalar_type() == at::kInt && words.numel() * 8 >= static_cast<int64_t>(n) * k,
+                "gemm8_tiled: (M / 16, K / 16, 256) fragments, (M, K / 64) group sums, group-major words");
+    TORCH_CHECK(xs.scalar_type() == at::kBFloat16 && a.scalar_type() == at::kFloat, "gemm8_tiled: bf16 sums, fp32 a");
+    TORCH_CHECK(x8.is_contiguous() && words.is_contiguous() && xs.is_contiguous() && out.is_contiguous(),
+                "gemm8_tiled takes contiguous tensors");
+    if (m == 0 || n == 0) return;
+    switch (variant) {
+        case 0: launch_tiled<2, 1, false>(x8, xs, a, words, scales, biases, m, n, k, out); break;
+        case 1: launch_tiled<2, 2, false>(x8, xs, a, words, scales, biases, m, n, k, out); break;
+        case 2: launch_tiled<4, 1, true>(x8, xs, a, words, scales, biases, m, n, k, out); break;
+        case 3: launch_tiled<4, 2, true>(x8, xs, a, words, scales, biases, m, n, k, out); break;
+        case 4: launch_tiled<2, 1, true>(x8, xs, a, words, scales, biases, m, n, k, out); break;
+        case 5: launch_tiled<2, 2, true>(x8, xs, a, words, scales, biases, m, n, k, out); break;
+        default: TORCH_CHECK(false, "gemm8_tiled: unknown variant");
     }
 }

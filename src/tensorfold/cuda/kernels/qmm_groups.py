@@ -465,12 +465,19 @@ def variant_for(m: int, n: int) -> int:
     return 12 if m >= 768 else 10
 
 
+def tiled_variant(m: int) -> int:
+    """qmm8_rocm's tiling for fragment-ordered rows (``TF_ROCM_PREFILL8_TILED`` fixes it); scheduling only."""
+
+    v = os.environ.get("TF_ROCM_PREFILL8_TILED")
+    return int(v) if v is not None else 0
+
+
 @lru_cache(maxsize=1)
 def _ext8():
     from tensorfold.cuda.build import load
 
     here = Path(__file__).parent
-    return load(name="tensorfold_qmm8_rocm_v9", sources=[str(here / "qmm8_rocm.cpp"), str(here / "qmm8_rocm.cu")],
+    return load(name="tensorfold_qmm8_rocm_v14", sources=[str(here / "qmm8_rocm.cpp"), str(here / "qmm8_rocm.cu")],
                 extra_cuda_cflags=["-O3", "--fmad=false"], verbose=False)
 
 
@@ -504,6 +511,11 @@ def prefill_matmul8(x: tuple[torch.Tensor, torch.Tensor, torch.Tensor], words: t
     x8, xs, a = x
     kg = words.shape[1]
     k = kg * 64
+    if x8.dim() == 3:                                 # fragment-ordered rows (prefill_glue's TILED): qmm8_rocm only
+        m = xs.shape[0]
+        out = torch.empty((m, n), dtype=torch.float32 if f32 else torch.bfloat16, device=x8.device)
+        _ext8().gemm8_tiled(x8, xs, a, words.contiguous(), scales, biases, n, out, tiled_variant(m))
+        return out
     if x8.dtype != torch.uint8 or x8.dim() != 2 or x8.shape[1] != k or xs.shape != (x8.shape[0], kg):
         raise ValueError(f"prefill matmul8: e4m3 rows (M, {k}) with (M, {kg}) group sums")
     m = x8.shape[0]
