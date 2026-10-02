@@ -326,11 +326,15 @@ def prefill_rows(w: Weights, items: list[tuple[Sequence[int], State, int]], *, t
             q, key = glue.attn_prep(qg, key, attn.q_norm, attn.k_norm, pos, w.inv_freq, c.eps, heads=c.heads,
                                     kv_heads=c.kv_heads, head_dim=c.head_dim, mrope_section=c.mrope_section)
             q, key = q.view(W, c.heads, c.head_dim), key.view(W, c.kv_heads, c.head_dim)
+            if w.kv_fp8:                                   # packed FP8 rows (``kv8``), as the one-stream prompt
+                key, value = kv8.pack(key)[1], kv8.pack(value)[1]
+            elif glue.kv_fp8():
+                key, value = glue.fp8_round(key), glue.fp8_round(value)
             outs = []
             for st, p0, (o, n) in zip(sts, p0s, spans):
                 kbuf, vbuf = _grow(st, i, p0 + n)
-                kbuf[p0:p0 + n] = key[o:o + n]
-                vbuf[p0:p0 + n] = value[o:o + n]
+                kbuf[p0:p0 + n] = key[o:o + n].view(n, c.kv_heads, -1)
+                vbuf[p0:p0 + n] = value[o:o + n].view(n, c.kv_heads, -1)
                 outs.append(attention(q[o:o + n], kbuf, vbuf, p0, scale=c.head_dim ** -0.5))
             r = _row_mm(pg.gate_mul(torch.cat(outs), qg, heads=c.heads, head_dim=c.head_dim), attn.o, tp)
         x, h = pg.add_rmsnorm(x, r, layer.post_norm, c.eps)
