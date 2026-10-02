@@ -434,10 +434,12 @@ def _gemm8(X8, XS, A, W8, S, B, OUT, M, N: tl.constexpr, K: tl.constexpr, BM: tl
 
 @lru_cache(maxsize=1)
 def prefill8_kernel() -> str:
-    """The FP8 prompt GEMM: ``triton`` (``_gemm8``) or ``hip`` (``qmm8_rocm.cu``, fp8 WMMA issued by hand);
-    ``TF_ROCM_PREFILL8_KERNEL`` picks it. Their bits differ, so a process uses one for every prompt."""
+    """The FP8 prompt GEMM: ``triton`` (``_gemm8``) or ``hip`` (``qmm8_rocm.cu``, fp8 WMMA issued by hand, the default
+    on RDNA4); ``TF_ROCM_PREFILL8_KERNEL`` picks it. Their bits differ, so a process uses one for every prompt."""
 
-    kind = os.environ.get("TF_ROCM_PREFILL8_KERNEL", "triton")
+    from tensorfold.cuda.build import gfx12
+
+    kind = os.environ.get("TF_ROCM_PREFILL8_KERNEL", "hip" if gfx12() else "triton")
     if kind not in ("triton", "hip"):
         raise ValueError("TF_ROCM_PREFILL8_KERNEL: triton or hip")
     return kind
