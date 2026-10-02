@@ -21,12 +21,15 @@
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <type_traits>
 
 namespace {
 
 typedef short short8 __attribute__((ext_vector_type(8)));
 typedef float float8 __attribute__((ext_vector_type(8)));
+typedef _Float16 half8 __attribute__((ext_vector_type(8)));
+typedef __fp16 half2v __attribute__((ext_vector_type(2)));
 
 constexpr int D = 256;
 constexpr int CH = 512;                     // keys a chunk, at fixed absolute positions (attention.CHUNK)
@@ -147,6 +150,24 @@ struct Stage16 {                            // bf16 rows (``Src``: a key's row, 
     }
 };
 
+// A pair of bf16 values as f16, round toward zero (exact for values in f16's normal range: bf16 keeps 8 bits).
+__device__ __forceinline__ unsigned h2(float a, float b) {
+    return __builtin_bit_cast(unsigned, __builtin_amdgcn_cvt_pkrtz(a, b));
+}
+
+__device__ __forceinline__ unsigned bf2_to_h2(unsigned w) {
+    return h2(__uint_as_float(w << 16), __uint_as_float(w & 0xFFFF0000u));
+}
+
+// Stage16 with the values widened to f16 as the loaders place them (prompt attention's F16 option).
+template <typename Src>
+struct Stage16H : Stage16<Src> {
+    __device__ static void put(Tile& t, int i, const uint4& kr, const uint4& vr) {
+        put_k(t, i, kr);
+        put_v(t, i, make_uint4(bf2_to_h2(vr.x), bf2_to_h2(vr.y), bf2_to_h2(vr.z), bf2_to_h2(vr.w)));
+    }
+};
+
 template <typename Src>
 struct Stage8 {                             // packed FP8 rows (``Src``: a key's packed row, or none), 16 values a piece
     static constexpr int P = 16 * D / 16, B = 2;
@@ -160,6 +181,20 @@ struct Stage8 {                             // packed FP8 rows (``Src``: a key's
         put_k16(t, i, lo, hi);
         widen(vr.b, vr.e, lo, hi);
         put_v16(t, i, lo, hi);
+    }
+};
+
+// Stage8 with the values as f16 (prompt attention's F16 option): the widened values convert exactly, so a packed cache
+// still folds what a bf16 cache of its rounded values does.
+template <typename Src>
+struct Stage8H : Stage8<Src> {
+    __device__ static void put(Tile& t, int i, const Raw8& kr, const Raw8& vr) {
+        uint4 lo, hi;
+        widen(kr.b, kr.e, lo, hi);
+        put_k16(t, i, lo, hi);
+        widen(vr.b, vr.e, lo, hi);
+        auto h = [](uint4 x) { return make_uint4(bf2_to_h2(x.x), bf2_to_h2(x.y), bf2_to_h2(x.z), bf2_to_h2(x.w)); };
+        put_v16(t, i, h(lo), h(hi));
     }
 };
 
@@ -301,6 +336,94 @@ __device__ __forceinline__ void fold(const Tile& t, const uint4 (&qb)[16], float
 #pragma unroll
     for (int n = 0; n < 16; ++n)
         o[n] = wmma(pa, *reinterpret_cast<const uint4*>(&t.vt[16 * n + c][8 * half]), o[n]);
+}
+
+// Prompt attention's fold with libr4d's ideas (ideas only: codeberg.org/StillDeadcode/libr4d,
+// r4d_attn_prefill_h256_gqa6.hip, carries no license and none of its code is used). OPT bits:
+//   FOLDQ  the query arrives scaled by scale * log2(e), so scores are base-2 exponents (one exp2, no multiply);
+//   MSKIP  the causal mask only on tiles that cross some row's position (``full``: wave-uniform);
+//   LAZY   probabilities against a reference max, raised (and O rescaled) only when a row's max passes it by GROW
+//          octaves, instead of rescaling whenever the max moves (needs FOLDQ);
+//   F16    P and V in f16 (one v_cvt_pkrtz for two values; gfx1201 has no bf16 conversion), P V on f16 WMMA;
+//   DOT2   a row's sum from the f16 P it multiplies, with v_dot2_f32_f16.
+// Bits follow OPT; every row folds its keys 16 at a time by absolute position either way, so chunking changes none.
+constexpr int O_FOLDQ = 1, O_MSKIP = 2, O_LAZY = 4, O_F16 = 8, O_DOT2 = 16;
+// What the prompt kernel runs, measured on an R9700 at 61K keys (2,560 rows): FOLDQ 55.3 -> 50.2 ms; MSKIP, LAZY,
+// F16 and DOT2 add no speed there, but F16 takes back FOLDQ's error (2.75e-3 -> 2.36e-3 against fp32 attention).
+// Packed FP8 caches take the same options (their values widen to f16 exactly), so they fold what bf16 caches of the
+// rounded values do.
+constexpr int PROMPT_OPT = O_FOLDQ | O_MSKIP | O_F16 | O_DOT2, PROMPT_OPT8 = PROMPT_OPT;
+
+template <int OPT>
+__device__ __forceinline__ void foldp(const Tile& t, const uint4 (&qb)[16], float8 (&o)[16], float& m, float& l,
+                                      unsigned valid, bool full, float scale, int c, int half) {
+    constexpr bool FQ = OPT & O_FOLDQ, F16 = OPT & O_F16;
+    float8 sc[2] = {float8{0, 0, 0, 0, 0, 0, 0, 0}, float8{0, 0, 0, 0, 0, 0, 0, 0}};
+#pragma unroll
+    for (int d = 0; d < 16; ++d)
+        sc[d & 1] = wmma(*reinterpret_cast<const uint4*>(&t.k[c][16 * d + 8 * half]), qb[d], sc[d & 1]);
+    float8 s = sc[0] + sc[1];
+    float mt = NEG;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        float v = FQ ? s[i] : s[i] * scale;
+        if (!(OPT & O_MSKIP) || !full) v = (valid >> (8 * half + i)) & 1u ? v : NEG;
+        s[i] = v;
+        mt = fmaxf(mt, v);
+    }
+    mt = fmaxf(mt, __shfl_xor(mt, 16));
+    auto ex = [](float x) { return FQ ? __builtin_amdgcn_exp2f(x) : __expf(x); };
+    float alpha = 1.0f;
+    bool moved;
+    if constexpr ((OPT & O_LAZY) != 0) {
+        static_assert(FQ, "LAZY counts octaves: it needs FOLDQ's base-2 scores");
+        constexpr float GROW = F16 ? 14.0f : 60.0f;   // p <= 2^GROW stays inside the P format
+        moved = mt != NEG && (m == NEG || mt > m + GROW);
+        if (moved) {
+            alpha = m == NEG ? 0.0f : ex(m - mt);
+            m = mt;
+        }
+    } else {
+        const bool active = mt != NEG;
+        const float next = active ? fmaxf(m, mt) : m;
+        alpha = active ? (m == NEG ? 0.0f : ex(m - next)) : 1.0f;
+        moved = alpha != 1.0f;
+        m = next;
+    }
+    if (__ballot(moved) != 0) {                                 // O rows 8 half + i: rescale those whose factor moved
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const float a = __shfl(alpha, 8 * half + i);
+            if (a != 1.0f) {
+#pragma unroll
+                for (int n = 0; n < 16; ++n) o[n][i] = o[n][i] * a;
+            }
+        }
+    }
+    unsigned pw[4];
+    float sum = 0.0f;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const float a = s[2 * j] != NEG ? ex(s[2 * j] - m) : 0.0f;
+        const float b = s[2 * j + 1] != NEG ? ex(s[2 * j + 1] - m) : 0.0f;
+        pw[j] = F16 ? h2(a, b) : pack2(a, b);
+        if constexpr ((OPT & O_DOT2) != 0 && F16)
+            sum = __builtin_amdgcn_fdot2(__builtin_bit_cast(half2v, pw[j]), half2v{1.0f, 1.0f}, sum, false);
+        else
+            sum = sum + a + b;
+    }
+    sum = sum + __shfl_xor(sum, 16);
+    l = l * alpha + sum;
+    const uint4 pa = make_uint4(pw[0], pw[1], pw[2], pw[3]);
+#pragma unroll
+    for (int n = 0; n < 16; ++n) {
+        const uint4 vb = *reinterpret_cast<const uint4*>(&t.vt[16 * n + c][8 * half]);
+        if constexpr (F16)
+            o[n] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(__builtin_bit_cast(half8, pa),
+                                                                    __builtin_bit_cast(half8, vb), o[n]);
+        else
+            o[n] = wmma(pa, vb, o[n]);
+    }
 }
 
 // A wave's partials: O rows are queries 8 half + i (``at(i)``: the pair's (chunk, row, head) index, or -1), m and l
@@ -519,7 +642,7 @@ __global__ void __launch_bounds__(NL) tail_kernel(
 // head. A block per 16 RB query rows and KV head, a compute wave per 16 rows and query head; PIPE: four loader waves
 // through the double buffer, else every wave loads each tile; KV8: packed FP8 caches (T, HK, ROW8). None of these
 // change a row's bits.
-template <int G, int RB, bool PIPE, bool KV8>
+template <int G, int RB, bool PIPE, bool KV8, int OPT = 0>
 __global__ void __launch_bounds__(32 * (G * RB + (PIPE ? LOADERS : 0))) prompt_kernel(
         const unsigned short* __restrict__ q, const void* __restrict__ kc, const void* __restrict__ vc,
         unsigned short* __restrict__ out, int p0, int w, int h, int hk_count, float scale) {
@@ -532,13 +655,21 @@ __global__ void __launch_bounds__(32 * (G * RB + (PIPE ? LOADERS : 0))) prompt_k
         if constexpr (KV8) {
             const auto* k8 = static_cast<const unsigned char*>(kc);
             const auto* v8 = static_cast<const unsigned char*>(vc);
-            return Stage8<Bounded<unsigned char>>{{k8 + kvh * ROW8, v8 + kvh * ROW8,
+            if constexpr ((OPT & O_F16) != 0)
+                return Stage8H<Bounded<unsigned char>>{{{k8 + kvh * ROW8, v8 + kvh * ROW8,
+                                                         static_cast<size_t>(hk_count) * ROW8, p0 + w}}};
+            else
+                return Stage8<Bounded<unsigned char>>{{k8 + kvh * ROW8, v8 + kvh * ROW8,
                                                    static_cast<size_t>(hk_count) * ROW8, p0 + w}};
         } else {
             const auto* k16 = static_cast<const unsigned short*>(kc);
             const auto* v16 = static_cast<const unsigned short*>(vc);
-            return Stage16<Bounded<unsigned short>>{{k16 + kvh * D, v16 + kvh * D,
-                                                     static_cast<size_t>(hk_count) * D, p0 + w}};
+            if constexpr ((OPT & O_F16) != 0)
+                return Stage16H<Bounded<unsigned short>>{{{k16 + kvh * D, v16 + kvh * D,
+                                                           static_cast<size_t>(hk_count) * D, p0 + w}}};
+            else
+                return Stage16<Bounded<unsigned short>>{{k16 + kvh * D, v16 + kvh * D,
+                                                         static_cast<size_t>(hk_count) * D, p0 + w}};
         }
     }();
     if constexpr (PIPE) {
@@ -553,6 +684,17 @@ __global__ void __launch_bounds__(32 * (G * RB + (PIPE ? LOADERS : 0))) prompt_k
     const int row = rows0 + c, pos = p0 + row;
     uint4 qb[16];
     query(live ? q + (static_cast<size_t>(min(row, w - 1)) * h + head) * D : nullptr, half, qb);
+    if constexpr ((OPT & O_FOLDQ) != 0) {                       // scale * log2(e) in the query, rounded to bf16 once
+        const float f = scale * 1.4426950408889634f;
+#pragma unroll
+        for (int t = 0; t < 16; ++t) {
+            unsigned e[4] = {qb[t].x, qb[t].y, qb[t].z, qb[t].w};
+#pragma unroll
+            for (int u = 0; u < 4; ++u)
+                e[u] = pack2(__uint_as_float(e[u] << 16) * f, __uint_as_float(e[u] & 0xFFFF0000u) * f);
+            qb[t] = make_uint4(e[0], e[1], e[2], e[3]);
+        }
+    }
     float8 o[16];
 #pragma unroll
     for (int n = 0; n < 16; ++n) o[n] = float8{0, 0, 0, 0, 0, 0, 0, 0};
@@ -561,16 +703,25 @@ __global__ void __launch_bounds__(32 * (G * RB + (PIPE ? LOADERS : 0))) prompt_k
         if (row >= w || pos < key0) return 0u;
         return pos >= key0 + 15 ? 0xFFFFu : (2u << (pos - key0)) - 1u;
     };
+    // every row of the wave sees the whole tile (wave-uniform: the wave's first row, all 16 rows before w)
+    auto full = [&](int key0) { return key0 + 15 <= p0 + rows0 && rows0 + 16 <= w; };
+
     if constexpr (PIPE) {
         fold_tiles(tb, tiles, [&](const Tile& t, int kt) {
-            if (live) fold<2>(t, qb, o, m, l, valid(16 * kt), scale, c, half);
+            if (live) {                                         // one lambda deep: O stays in registers
+                if constexpr (OPT != 0) foldp<OPT>(t, qb, o, m, l, valid(16 * kt), full(16 * kt), scale, c, half);
+                else fold<2>(t, qb, o, m, l, valid(16 * kt), scale, c, half);
+            }
         });
     } else {
         for (int kt = 0; kt < tiles; ++kt) {
             __syncthreads();                                    // the previous tile is consumed
             stage(tb[0], src, 16 * kt);
             __syncthreads();
-            if (live) fold<2>(tb[0], qb, o, m, l, valid(16 * kt), scale, c, half);
+            if (live) {
+                if constexpr (OPT != 0) foldp<OPT>(tb[0], qb, o, m, l, valid(16 * kt), full(16 * kt), scale, c, half);
+                else fold<2>(tb[0], qb, o, m, l, valid(16 * kt), scale, c, half);
+            }
         }
     }
     if (!live) return;
@@ -649,7 +800,7 @@ void prompt_attention(const at::Tensor& q, const at::Tensor& k_cache, const at::
     auto* op = reinterpret_cast<unsigned short*>(out.data_ptr());
     const float sc = static_cast<float>(scale);
 #define LAUNCH(G, RB, PIPE, KV8)                                                                                  \
-    hipLaunchKernelGGL((prompt_kernel<G, RB, PIPE, KV8>), grid, dim3(32 * ((G) * (RB) + ((PIPE) ? LOADERS : 0))), \
+    hipLaunchKernelGGL((prompt_kernel<G, RB, PIPE, KV8, (KV8) ? PROMPT_OPT8 : PROMPT_OPT>), grid, dim3(32 * ((G) * (RB) + ((PIPE) ? LOADERS : 0))), \
                        0, stream, qp, kp, vp, op, p0, w, h, hk, sc)
 #define FORMAT(G, RB, PIPE)                                                                      \
     if (kv8) LAUNCH(G, RB, PIPE, true); else LAUNCH(G, RB, PIPE, false);
