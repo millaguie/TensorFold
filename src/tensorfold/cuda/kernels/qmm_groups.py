@@ -445,7 +445,10 @@ def prefill8_config() -> tuple[int, int, int, int]:
     Triton 3.6 on gfx1201, pipelined tiles (stages 2 or 3) give wrong sums for calls of a few rows at some K; single
     stage tiles are exact, and this one led them at the 27B's shapes (121-151 TFLOPS against 81-115 for bf16)."""
 
-    bm, bn, warps, stages = _ints("TF_ROCM_PREFILL8", "128,128,4,1", 4)
+    # warps never change a tile's bits; Triton 3.7 and 3.8 schedule this dot 3x slower with 4 (gfx1201, M=2560: 38-40
+    # against 111-129 TFLOPS with 8), while 3.6 leads with 4 (116-144 against 110-129)
+    legacy = tuple(int(v) for v in triton.__version__.split(".")[:2]) < (3, 7)
+    bm, bn, warps, stages = _ints("TF_ROCM_PREFILL8", f"128,128,{4 if legacy else 8},1", 4)
     if min(bm, bn) < 16:
         raise ValueError("TF_ROCM_PREFILL8: BM and BN at least 16")
     return bm, bn, warps, stages
