@@ -252,12 +252,21 @@ __device__ __forceinline__ void query(const unsigned short* row, int half, uint4
 
 // One 16-key tile into a wave's 16 queries: Triton ``_tile``'s online softmax, a query at a time, keys outside
 // ``valid`` (bit j: key j of the tile) at -inf. A query's scores sit in lanes c and c + 16 (keys 8 half + i).
+// CHAINS: the scores' 16 WMMAs as that many independent chains (dims d % CHAINS), added in order at the end: two let
+// a wave issue the next WMMA while one finishes (prompt attention, 12% faster on an R9700 at 61K keys). Bits follow
+// CHAINS, the same for every query at any chunking; the tree kernels keep one chain.
+template <int CHAINS = 1>
 __device__ __forceinline__ void fold(const Tile& t, const uint4 (&qb)[16], float8 (&o)[16], float& m, float& l,
                                      unsigned valid, float scale, int c, int half) {
-    float8 s = float8{0, 0, 0, 0, 0, 0, 0, 0};
+    float8 sc[CHAINS];
+#pragma unroll
+    for (int j = 0; j < CHAINS; ++j) sc[j] = float8{0, 0, 0, 0, 0, 0, 0, 0};
 #pragma unroll
     for (int d = 0; d < 16; ++d)
-        s = wmma(*reinterpret_cast<const uint4*>(&t.k[c][16 * d + 8 * half]), qb[d], s);
+        sc[d % CHAINS] = wmma(*reinterpret_cast<const uint4*>(&t.k[c][16 * d + 8 * half]), qb[d], sc[d % CHAINS]);
+    float8 s = sc[0];
+#pragma unroll
+    for (int j = 1; j < CHAINS; ++j) s = s + sc[j];
     float mt = NEG;
 #pragma unroll
     for (int i = 0; i < 8; ++i) {
@@ -554,14 +563,14 @@ __global__ void __launch_bounds__(32 * (G * RB + (PIPE ? LOADERS : 0))) prompt_k
     };
     if constexpr (PIPE) {
         fold_tiles(tb, tiles, [&](const Tile& t, int kt) {
-            if (live) fold(t, qb, o, m, l, valid(16 * kt), scale, c, half);
+            if (live) fold<2>(t, qb, o, m, l, valid(16 * kt), scale, c, half);
         });
     } else {
         for (int kt = 0; kt < tiles; ++kt) {
             __syncthreads();                                    // the previous tile is consumed
             stage(tb[0], src, 16 * kt);
             __syncthreads();
-            if (live) fold(tb[0], qb, o, m, l, valid(16 * kt), scale, c, half);
+            if (live) fold<2>(tb[0], qb, o, m, l, valid(16 * kt), scale, c, half);
         }
     }
     if (!live) return;
