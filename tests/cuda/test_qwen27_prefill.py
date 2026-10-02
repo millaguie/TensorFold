@@ -8,7 +8,7 @@ if not torch.cuda.is_available():
     pytest.skip("CUDA only", allow_module_level=True)
 
 from tensorfold.cuda import prompt_precision  # noqa: E402
-from tensorfold.cuda.build import hip  # noqa: E402
+from tensorfold.cuda.build import gfx12, hip  # noqa: E402
 from tensorfold.cuda.kernels import qmm as shared  # noqa: E402
 from tensorfold.cuda.kernels.prefill_attention import attention  # noqa: E402
 from tensorfold.families.qwen3_5.cuda.decode import clone_state, draft_decode, prefill, serial_decode  # noqa: E402
@@ -283,6 +283,47 @@ def test_rocm_fp8_prefill_matmul_is_exact_on_its_inputs_and_chunk_invariant(n, k
         parts = [qmm_groups.prefill_matmul8(tuple(t[a:a + size].contiguous() for t in rows), *g, n, f32=True)
                  for a in range(0, 300, size)]
         assert torch.equal(whole, torch.cat(parts)), size
+
+
+def _fragments(x8: torch.Tensor) -> torch.Tensor:
+    """(M, K) e4m3 rows in prefill_glue's TILED order: (M / 16, K / 16, 256), lane l's 8 bytes being row l % 16."""
+
+    m, k = x8.shape
+    mt = (m + 15) // 16
+    padded = torch.zeros((mt * 16, k), dtype=torch.uint8, device=x8.device)
+    padded[:m] = x8
+    return padded.view(mt, 16, k // 16, 2, 8).permute(0, 2, 3, 1, 4).reshape(mt, k // 16, 256).contiguous()
+
+
+@pytest.mark.skipif(not gfx12(), reason="qmm8_rocm.cu: RDNA4's fp8 WMMA")
+@pytest.mark.parametrize("variant", range(6))
+@pytest.mark.parametrize("n,k", [(48, 5120), (1024, 5120), (17408, 5120), (5120, 17408), (384, 128)])
+def test_rocm_fp8_prefill_matmul_on_fragments_equals_rows_at_any_chunking(n, k, variant, monkeypatch):
+    """qmm8_rocm on fragment-ordered rows gives the staged kernel's bits on the same e4m3 rows, at every tiling and
+    chunking."""
+
+    from tensorfold.cuda.kernels import qmm_groups
+
+    monkeypatch.setenv("TF_ROCM_PREFILL8_KERNEL", "hip")
+    monkeypatch.setenv("TF_ROCM_PREFILL8_TILED", str(variant))
+    qmm_groups.prefill8_kernel.cache_clear()
+    gen = torch.Generator(device="cuda").manual_seed(n + 5 * k)
+    words = torch.randint(-(2**31), 2**31 - 1, (n, k // 8), generator=gen, device="cuda", dtype=torch.int64)
+    g = qmm_groups.to_groups(words.to(torch.int32), (torch.rand(n, k // 64, generator=gen, device="cuda") * 0.003
+                                                     + 0.001).bfloat16(),
+                             (torch.rand(n, k // 64, generator=gen, device="cuda") * 0.003 - 0.0015).bfloat16())
+    rows = _e4m3_rows(torch.randn(300, k, generator=gen, device="cuda").bfloat16())[0]
+    try:
+        plain = qmm_groups.prefill_matmul8(rows, *g, n, f32=True)
+        tiled = qmm_groups.prefill_matmul8((_fragments(rows[0]), rows[1], rows[2]), *g, n, f32=True)
+        assert torch.equal(plain, tiled)
+        for size in (1, 7, 16, 64, 256):
+            parts = [qmm_groups.prefill_matmul8((_fragments(rows[0][a:a + size]), rows[1][a:a + size].contiguous(),
+                                                 rows[2][a:a + size].contiguous()), *g, n, f32=True)
+                     for a in range(0, 300, size)]
+            assert torch.equal(tiled, torch.cat(parts)), size
+    finally:
+        qmm_groups.prefill8_kernel.cache_clear()
 
 
 @pytest.mark.skipif(not hip(), reason="the group-major layout and its lane matmul serve ROCm only")
