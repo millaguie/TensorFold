@@ -41,6 +41,7 @@ def hip_arch() -> str:
     return torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
 
 
+@lru_cache(maxsize=1)
 def gfx12() -> bool:
     """An RDNA4 GPU (gfx12xx): the WMMA kernels and the FP8 paths are written and checked for it alone."""
 
