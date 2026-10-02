@@ -479,7 +479,7 @@ def _ext8():
     from tensorfold.cuda.build import load
 
     here = Path(__file__).parent
-    return load(name="tensorfold_qmm8_rocm_v14", sources=[str(here / "qmm8_rocm.cpp"), str(here / "qmm8_rocm.cu")],
+    return load(name="tensorfold_qmm8_rocm_v15", sources=[str(here / "qmm8_rocm.cpp"), str(here / "qmm8_rocm.cu")],
                 extra_cuda_cflags=["-O3", "--fmad=false"], verbose=False)
 
 

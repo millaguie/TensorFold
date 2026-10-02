@@ -133,10 +133,13 @@ __device__ __forceinline__ void stage_words(uint8_t* lds, const uint4& v) {
     dst[3] = make_uint2(b1.z, b1.w);
 }
 
-// A workgroup barrier that waits only for LDS traffic: __syncthreads() also drains the block's outstanding global
-// loads (the next stage's prefetch) at every stage. The idea is radiance's (radiance_mxfp4_fp8.hip), the code ours.
+// A workgroup barrier fenced on LDS only: __syncthreads() also drains the block's outstanding global loads (the next
+// stage's prefetch) at every stage. The idea and this three-call form follow radiance's notes (radiance_mxfp4_fp8.hip);
+// it is the one way to spell it.
 __device__ __forceinline__ void lds_barrier() {
-    asm volatile("s_wait_dscnt 0x0\n\ts_barrier_signal -1\n\ts_barrier_wait -1" ::: "memory");
+    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup", "local");
+    __builtin_amdgcn_s_barrier();
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup", "local");
 }
 
 template <bool LDSBAR>
@@ -154,8 +157,8 @@ __global__ void __launch_bounds__(32 * WM * WN) gemm8_kernel(
         const unsigned short* __restrict__ biases, int m, int n, int k, int group, void* __restrict__ out, bool f32) {
     using C = Cfg<BM, BN, WM, WN, GPS, NB>;
     constexpr int MT = C::MT, NT = C::NT, SK = C::SK, PITCH = C::PITCH, T = C::THREADS;
-    __shared__ uint8_t xl[NB][BM * PITCH];
-    __shared__ uint8_t wl[NB][BN * PITCH];
+    __shared__ __align__(16) uint8_t xl[NB][BM * PITCH];   // 8-byte accesses: the base must not rely on luck
+    __shared__ __align__(16) uint8_t wl[NB][BN * PITCH];
     const int kg = k / GK, stages = (kg + GPS - 1) / GPS;
     // grouped order: `group` row blocks at a time down each column block, so their inputs and weights meet in cache
     const int blocks_m = (m + BM - 1) / BM, blocks_n = (n + BN - 1) / BN;
@@ -319,7 +322,7 @@ __global__ void __launch_bounds__(256) gemm8_tiled_kernel(
     constexpr int WN = 2, TM = 4, BM = 256, BN = WN * TN * 16;
     constexpr int LBK = GPS * GK, NS = LBK / 16, PITCH = LBK + 8;
     constexpr int PIECES = BN * GPS * 2, P = (PIECES + 255) / 256;   // 16-byte word pieces a slab, a thread
-    __shared__ uint8_t wl[BN * PITCH];
+    __shared__ __align__(16) uint8_t wl[BN * PITCH];         // 8-byte accesses: the base must not rely on luck
     const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5;
     const int wm = wave / WN, wn = wave % WN;
     const int h = lane >> 4, c = lane & 15;
@@ -502,6 +505,9 @@ void gemm8(const at::Tensor& x8, const at::Tensor& xs, const at::Tensor& a, cons
                                    : w8.size(1) == k && w8.size(0) >= n),
                 "gemm8: (M, K) e4m3 rows against (N, K) codes or group-major 4-bit words");
     TORCH_CHECK(xs.scalar_type() == at::kBFloat16 && a.scalar_type() == at::kFloat, "gemm8: bf16 group sums, fp32 a");
+    TORCH_CHECK(xs.size(0) == m && xs.size(1) == k / GK && a.numel() == m &&
+                scales.numel() >= static_cast<int64_t>((n + 15) / 16) * (k / GK) * 16 && biases.numel() == scales.numel(),
+                "gemm8: (M, K / 64) group sums, M row scales, group-major scales and biases for N outputs");
     TORCH_CHECK(x8.is_contiguous() && w8.is_contiguous() && xs.is_contiguous() && out.is_contiguous(),
                 "gemm8 takes contiguous tensors");
     TORCH_CHECK(w4 == (variant >= 10), "gemm8: variants 10 and up take the words, the others _nibbles8's codes");
@@ -529,6 +535,8 @@ void gemm8_tiled(const at::Tensor& x8, const at::Tensor& xs, const at::Tensor& a
                 xs.size(1) == k / GK && words.scalar_type() == at::kInt && words.numel() * 8 >= static_cast<int64_t>(n) * k,
                 "gemm8_tiled: (M / 16, K / 16, 256) fragments, (M, K / 64) group sums, group-major words");
     TORCH_CHECK(xs.scalar_type() == at::kBFloat16 && a.scalar_type() == at::kFloat, "gemm8_tiled: bf16 sums, fp32 a");
+    TORCH_CHECK(a.numel() == m && scales.numel() >= static_cast<int64_t>((n + 15) / 16) * (k / GK) * 16 &&
+                biases.numel() == scales.numel(), "gemm8_tiled: M row scales, group-major scales and biases for N outputs");
     TORCH_CHECK(x8.is_contiguous() && words.is_contiguous() && xs.is_contiguous() && out.is_contiguous(),
                 "gemm8_tiled takes contiguous tensors");
     if (m == 0 || n == 0) return;
