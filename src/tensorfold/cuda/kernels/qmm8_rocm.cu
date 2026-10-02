@@ -91,6 +91,48 @@ __device__ __forceinline__ void stage(uint8_t* lds, const uint4 (&v)[P]) {
     }
 }
 
+// The 4-bit codes of 16 inputs (words w0 = inputs 0-7 and w1 = 8-15 of a 16-input block, nibble of input i at
+// 4 * (i % 8 / 2) + 16 * (i % 2)) as e4m3 bytes in prefill_glue's stored order, where position 4a + j holds input
+// 2a + j % 2 + 8 * (j / 2): exactly _nibbles8's bytes, so the products and their bits are unchanged.
+__device__ __forceinline__ uint4 codes16(unsigned w0, unsigned w1) {
+    // e4m3 of 0..7 and of 8..15, a byte each, for v_perm_b32's byte select
+    constexpr unsigned LO0 = 0x44403800u, LO1 = 0x4E4C4A48u, HI0 = 0x53525150u, HI1 = 0x57565554u;
+    unsigned out[4];
+#pragma unroll
+    for (int a = 0; a < 4; ++a) {
+        const unsigned x = (w0 >> (4 * a)) & 0x000F000Fu, y = (w1 >> (4 * a)) & 0x000F000Fu;
+        const unsigned q = __builtin_amdgcn_perm(y, x, 0x06040200u);    // bytes: inputs 2a, 2a+1, 2a+8, 2a+9
+        const unsigned sel = q & 0x07070707u;
+        const unsigned lo = __builtin_amdgcn_perm(LO1, LO0, sel), hi = __builtin_amdgcn_perm(HI1, HI0, sel);
+        const unsigned big = ((q >> 3) & 0x01010101u) * 0xFFu;          // 0xFF in each byte whose code is 8 or more
+        out[a] = (lo & ~big) | (hi & big);
+    }
+    return make_uint4(out[0], out[1], out[2], out[3]);
+}
+
+// A stage's weight codes straight from the group-major words: thread t takes column t / 2, half t % 2 (32 inputs:
+// four words, 16 bytes), so 16 columns read 512 contiguous bytes. Columns past n re-read the last one; in a block of
+// more than 2 BN threads the rest repeat the first ones' reads (no branch) and stage nothing.
+template <int BN, int THREADS>
+__device__ __forceinline__ uint4 fetch_words(const unsigned* __restrict__ words, int n, int col0, int kg, int g) {
+    static_assert(THREADS % (BN * 2) == 0, "whole half columns a thread");
+    const int t = threadIdx.x % (BN * 2);
+    const int col = min(col0 + (t >> 1), n - 1), half = t & 1;
+    return *reinterpret_cast<const uint4*>(words + tile_at(min(g, kg - 1), kg, col) * 8 + 4 * half);
+}
+
+template <int BN, int PITCH>
+__device__ __forceinline__ void stage_words(uint8_t* lds, const uint4& v) {
+    if (threadIdx.x >= BN * 2) return;
+    const int col = threadIdx.x >> 1, half = threadIdx.x & 1;
+    const uint4 b0 = codes16(v.x, v.y), b1 = codes16(v.z, v.w);
+    uint2* dst = reinterpret_cast<uint2*>(lds + col * PITCH + 32 * half);
+    dst[0] = make_uint2(b0.x, b0.y);
+    dst[1] = make_uint2(b0.z, b0.w);
+    dst[2] = make_uint2(b1.x, b1.y);
+    dst[3] = make_uint2(b1.z, b1.w);
+}
+
 // A workgroup barrier that waits only for LDS traffic: __syncthreads() also drains the block's outstanding global
 // loads (the next stage's prefetch) at every stage. The idea is radiance's (radiance_mxfp4_fp8.hip), the code ours.
 __device__ __forceinline__ void lds_barrier() {
@@ -103,10 +145,12 @@ __device__ __forceinline__ void barrier() {
     else __syncthreads();
 }
 
-template <int BM, int BN, int WM, int WN, int GPS, int NB, bool LDSBAR>
+// W4: the weight operand is the group-major 4-bit words, widened to e4m3 while staged (one stage = one group);
+// otherwise it is _nibbles8's (N, K) e4m3 codes.
+template <int BM, int BN, int WM, int WN, int GPS, int NB, bool LDSBAR, bool W4>
 __global__ void __launch_bounds__(32 * WM * WN) gemm8_kernel(
         const uint8_t* __restrict__ x8, const unsigned short* __restrict__ xs, const float* __restrict__ a,
-        const uint8_t* __restrict__ w8, const unsigned short* __restrict__ scales,
+        const void* __restrict__ wsrc, const unsigned short* __restrict__ scales,
         const unsigned short* __restrict__ biases, int m, int n, int k, int group, void* __restrict__ out, bool f32) {
     using C = Cfg<BM, BN, WM, WN, GPS, NB>;
     constexpr int MT = C::MT, NT = C::NT, SK = C::SK, PITCH = C::PITCH, T = C::THREADS;
@@ -128,14 +172,19 @@ __global__ void __launch_bounds__(32 * WM * WN) gemm8_kernel(
 #pragma unroll
         for (int u = 0; u < NT; ++u) acc[t][u] = float8{0, 0, 0, 0, 0, 0, 0, 0};
 
-    uint4 xn[C::XP], wn[C::WP];
+    static_assert(!W4 || GPS == 1, "W4 stages one group at a time");
+    const uint8_t* w8 = static_cast<const uint8_t*>(wsrc);
+    const unsigned* words = static_cast<const unsigned*>(wsrc);
+    uint4 xn[C::XP], wn[C::WP], wq;
     fetch<BM, SK, T>(xn, x8, m, row0, k, 0);
-    fetch<BN, SK, T>(wn, w8, n, col0, k, 0);
+    if constexpr (W4) wq = fetch_words<BN, T>(words, n, col0, kg, 0);
+    else fetch<BN, SK, T>(wn, w8, n, col0, k, 0);
     for (int st = 0; st < stages; ++st) {
         const int buf = NB == 1 ? 0 : st % NB;
         if (NB == 1) barrier<LDSBAR>();                  // one buffer: the last stage's reads are done
         stage<SK, PITCH, T>(xl[buf], xn);
-        stage<SK, PITCH, T>(wl[buf], wn);
+        if constexpr (W4) stage_words<BN, PITCH>(wl[buf], wq);
+        else stage<SK, PITCH, T>(wl[buf], wn);
         barrier<LDSBAR>();                               // staged (with NB 2, also: the buffer before it is free)
         // this stage's scales first, then the next stage's operands: the scales' wait (a load counter, in order)
         // then leaves the prefetch in flight under the WMMAs
@@ -150,7 +199,8 @@ __global__ void __launch_bounds__(32 * WM * WN) gemm8_kernel(
         // the next stage's reads fly under this one's WMMAs; after the last stage they re-read its slab (unused): a
         // branch here would join two paths, and the compiler then drains every load before the WMMAs
         fetch<BM, SK, T>(xn, x8, m, row0, k, (st + 1) * SK);
-        fetch<BN, SK, T>(wn, w8, n, col0, k, (st + 1) * SK);
+        if constexpr (W4) wq = fetch_words<BN, T>(words, n, col0, kg, st + 1);
+        else fetch<BN, SK, T>(wn, w8, n, col0, k, (st + 1) * SK);
         asm volatile("" ::: "memory");                   // keep them issued here: the compiler sinks them to their use
 #pragma unroll
         for (int j = 0; j < GPS; ++j) {
@@ -236,13 +286,13 @@ __global__ void __launch_bounds__(32 * WM * WN) gemm8_kernel(
         }
 }
 
-template <int BM, int BN, int WM, int WN, int GPS, int NB, bool LDSBAR = false>
+template <int BM, int BN, int WM, int WN, int GPS, int NB, bool LDSBAR = false, bool W4 = false>
 void launch(const at::Tensor& x8, const at::Tensor& xs, const at::Tensor& a, const at::Tensor& w8,
             const at::Tensor& scales, const at::Tensor& biases, int m, int n, int k, int group, at::Tensor& out) {
     const int blocks = ((m + BM - 1) / BM) * ((n + BN - 1) / BN);
-    gemm8_kernel<BM, BN, WM, WN, GPS, NB, LDSBAR><<<blocks, 32 * WM * WN, 0, at::cuda::getCurrentCUDAStream()>>>(
+    gemm8_kernel<BM, BN, WM, WN, GPS, NB, LDSBAR, W4><<<blocks, 32 * WM * WN, 0, at::cuda::getCurrentCUDAStream()>>>(
         x8.data_ptr<uint8_t>(), reinterpret_cast<const unsigned short*>(xs.data_ptr()), a.data_ptr<float>(),
-        w8.data_ptr<uint8_t>(), reinterpret_cast<const unsigned short*>(scales.data_ptr()),
+        w8.data_ptr(), reinterpret_cast<const unsigned short*>(scales.data_ptr()),
         reinterpret_cast<const unsigned short*>(biases.data_ptr()), m, n, k, group, out.data_ptr(),
         out.scalar_type() == at::kFloat);
 }
@@ -253,10 +303,14 @@ void launch(const at::Tensor& x8, const at::Tensor& xs, const at::Tensor& a, con
 void gemm8(const at::Tensor& x8, const at::Tensor& xs, const at::Tensor& a, const at::Tensor& w8,
            const at::Tensor& scales, const at::Tensor& biases, int n, int group, at::Tensor& out, int variant) {
     const int m = static_cast<int>(x8.size(0)), k = static_cast<int>(x8.size(1));
-    TORCH_CHECK(k % GK == 0 && w8.size(1) == k && w8.size(0) >= n, "gemm8: (M, K) e4m3 rows against (N, K) codes");
+    const bool w4 = w8.scalar_type() == at::kInt;      // group-major words, widened in the kernel
+    TORCH_CHECK(k % GK == 0 && (w4 ? w8.numel() * 8 >= static_cast<int64_t>(n) * k
+                                   : w8.size(1) == k && w8.size(0) >= n),
+                "gemm8: (M, K) e4m3 rows against (N, K) codes or group-major 4-bit words");
     TORCH_CHECK(xs.scalar_type() == at::kBFloat16 && a.scalar_type() == at::kFloat, "gemm8: bf16 group sums, fp32 a");
     TORCH_CHECK(x8.is_contiguous() && w8.is_contiguous() && xs.is_contiguous() && out.is_contiguous(),
                 "gemm8 takes contiguous tensors");
+    TORCH_CHECK(w4 == (variant >= 10), "gemm8: variants 10 and up take the words, the others _nibbles8's codes");
     if (m == 0 || n == 0) return;
     switch (variant) {
         case 0: launch<128, 128, 2, 4, 1, 2>(x8, xs, a, w8, scales, biases, m, n, k, group, out); break;
@@ -264,6 +318,11 @@ void gemm8(const at::Tensor& x8, const at::Tensor& xs, const at::Tensor& a, cons
         case 2: launch<128, 128, 2, 4, 2, 1, true>(x8, xs, a, w8, scales, biases, m, n, k, group, out); break;
         case 3: launch<256, 128, 4, 4, 1, 2, true>(x8, xs, a, w8, scales, biases, m, n, k, group, out); break;
         case 8: launch<128, 128, 4, 2, 1, 2, true>(x8, xs, a, w8, scales, biases, m, n, k, group, out); break;
+        case 10: launch<128, 128, 2, 4, 1, 2, false, true>(x8, xs, a, w8, scales, biases, m, n, k, group, out); break;
+        case 11: launch<128, 128, 2, 4, 1, 2, true, true>(x8, xs, a, w8, scales, biases, m, n, k, group, out); break;
+        case 12: launch<256, 128, 4, 4, 1, 2, false, true>(x8, xs, a, w8, scales, biases, m, n, k, group, out); break;
+        case 13: launch<256, 128, 4, 4, 1, 2, true, true>(x8, xs, a, w8, scales, biases, m, n, k, group, out); break;
+        case 14: launch<128, 64, 2, 2, 1, 2, false, true>(x8, xs, a, w8, scales, biases, m, n, k, group, out); break;
         default: TORCH_CHECK(false, "gemm8: unknown variant");
     }
 }
