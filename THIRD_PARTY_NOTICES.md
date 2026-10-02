@@ -137,3 +137,7 @@ of the CUDA engine and adds to them:
   (`radiance_mxfp4_fp8.hip`, mirrored at github.com/magiccodingman/vllm-radiance): issuing the fp8 WMMA by hand,
   staging operands through LDS and padding LDS rows against bank conflicts. That repository carries no license, so
   none of its code is used.
+- The prompt attention's softmax options (`foldp` in `cuda/kernels/attention_rocm.cu`: the query scaled by
+  scale * log2(e), masks only on edge tiles, f16 P and V with `v_cvt_pkrtz`, the row sum by `v_dot2_f32_f16`, a lazy
+  reference max) take ideas, not code, from [libr4d](https://codeberg.org/StillDeadcode/libr4d)'s prefill attention
+  (`r4d_attn_prefill_h256_gqa6.hip`), by the author of vLLM-radiance. That repository carries no license either.
