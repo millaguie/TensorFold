@@ -53,6 +53,8 @@ class Qwen27Engine:
                              "on AMD GPUs serve the MLX checkpoint (Vontra/Qwen3.8-27B-MLX-4bit)")
         if vision and hip():
             raise ValueError("image input is untested on AMD GPUs: drop --vision there")
+        if tp != 1 and hip():               # the CLI says so too; this stops an engine started without it
+            raise ValueError("two-rank serving exchanges partials over NCCL; on AMD GPUs serve one rank")
         if (exl3 or nvfp4) and tp != 1:
             raise ValueError(f"{'EXL3 packs' if exl3 else 'NVFP4 checkpoints'} of Qwen3.8-27B run on one GPU: drop "
                              "--tp 2, or serve the MLX checkpoint (Vontra/Qwen3.8-27B-MLX-4bit) on two")

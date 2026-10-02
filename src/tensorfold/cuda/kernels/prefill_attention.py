@@ -143,7 +143,7 @@ def _rocm_attention(q: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tenso
     bm, bn, warps, stages, first = rocm_config()
     grid = (h, triton.cdiv(w, bm)) if first else (triton.cdiv(w, bm), h)
     _attend[grid](q, k_cache, v_cache, out, p0, w, H=h, HK=k_cache.shape[1], D=d, BM=bm, BN=bn, SCALE=scale,
-                  ONE_LOOP=True, HEADS_FIRST=bool(first), num_warps=warps, num_stages=stages)
+                  SPLIT_V=True, ONE_LOOP=True, HEADS_FIRST=bool(first), num_warps=warps, num_stages=stages)
     return out
 
 

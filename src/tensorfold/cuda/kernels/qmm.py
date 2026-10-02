@@ -19,7 +19,7 @@ def _ext():
     from tensorfold.cuda.rocm import HIP
 
     if HIP:                          # qmm_frag.cuh is inline PTX (cp.async, ldmatrix, mma): NVIDIA only
-        raise RuntimeError("tensorfold_qmm_v3 is CUDA-only (inline PTX); on ROCm the 4-bit paths use the Triton "
+        raise RuntimeError("tensorfold_qmm_v5 is CUDA-only (inline PTX); on ROCm the 4-bit paths use the Triton "
                            "lane matmul and the qgemv decode kernels")
 
     here = Path(__file__).parent
