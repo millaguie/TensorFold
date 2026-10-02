@@ -148,7 +148,7 @@ class Qwen27Engine:
         if tp == 2:
             full = load(model_dir)
             self.w = split_weights(full, rank, tiled=True, split_head=split_head)
-        elif gfx12():                              # RDNA4: [gate|up], [z|b|a] and [k|v] fused, members as views
+        elif gfx12() and not gguf:                 # RDNA4: [gate|up], [z|b|a] and [k|v] fused, members as views
             from .qmm_fast import prepare
 
             full = load(model_dir)

@@ -16,8 +16,8 @@ def tile(q: QLinear) -> QLinear:
     """The packed decode layout: tensor-core fragments on NVIDIA, 16-output tiles on RDNA4 (``qmm_groups``), the stored
     layout on other ROCm GPUs (the Triton lane matmul and ``qgemv``)."""
 
-    if q.layout in ("tiled", "groups") or not q.fast:
-        return q
+    if not isinstance(q, QLinear) or q.layout in ("tiled", "groups") or not q.fast:
+        return q                                     # GGUF and plain bf16 projections keep their own kernels
     if gfx12():
         return QLinear(*groups.to_groups(q.weight, q.scales, q.biases), layout="groups", rows=q.n)
     if hip():
@@ -41,6 +41,8 @@ def rows(q: QLinear, a: int, b: int) -> QLinear:
 
     if q.layout == "mlx":                            # ROCm keeps the stored layout: rows are plain views
         return QLinear(q.weight[a:b], q.scales[a:b], q.biases[a:b], gs=q.gs, bits=q.bits)
+    if q.layout != "tiled":                          # RDNA4's 16-output tiles: untile first (the drafter does)
+        raise ValueError(f"rows() slices tiled or stored weights, not the {q.layout!r} layout")
     if a % 64 == 0 and (b - a) % 128 == 0:
         return QLinear(q.weight[a // 64:b // 64], q.scales[:, a:b], q.biases[:, a:b], layout="tiled", rows=b - a)
     t0, t1 = a // 64, -(-b // 64)
