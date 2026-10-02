@@ -433,6 +433,33 @@ def _gemm8(X8, XS, A, W8, S, B, OUT, M, N: tl.constexpr, K: tl.constexpr, BM: tl
 
 
 @lru_cache(maxsize=1)
+def prefill8_kernel() -> str:
+    """The FP8 prompt GEMM: ``triton`` (``_gemm8``) or ``hip`` (``qmm8_rocm.cu``, fp8 WMMA issued by hand);
+    ``TF_ROCM_PREFILL8_KERNEL`` picks it. Their bits differ, so a process uses one for every prompt."""
+
+    kind = os.environ.get("TF_ROCM_PREFILL8_KERNEL", "triton")
+    if kind not in ("triton", "hip"):
+        raise ValueError("TF_ROCM_PREFILL8_KERNEL: triton or hip")
+    return kind
+
+
+@lru_cache(maxsize=1)
+def prefill8_variant() -> int:
+    """``qmm8_rocm.cu``'s tiling (``TF_ROCM_PREFILL8_VARIANT``): scheduling only, never bits."""
+
+    return int(os.environ.get("TF_ROCM_PREFILL8_VARIANT", "0"))
+
+
+@lru_cache(maxsize=1)
+def _ext8():
+    from tensorfold.cuda.build import load
+
+    here = Path(__file__).parent
+    return load(name="tensorfold_qmm8_rocm_v7", sources=[str(here / "qmm8_rocm.cpp"), str(here / "qmm8_rocm.cu")],
+                extra_cuda_cflags=["-O3", "--fmad=false"], verbose=False)
+
+
+@lru_cache(maxsize=1)
 def prefill8_group() -> int:
     """Row blocks a column block's tiles take together (``TF_ROCM_PREFILL8_GROUP``); scheduling only, never bits."""
 
@@ -467,8 +494,11 @@ def prefill_matmul8(x: tuple[torch.Tensor, torch.Tensor, torch.Tensor], words: t
     m = x8.shape[0]
     w8 = _buffer(words.device, n * k).view(n, k)
     _nibbles8[(kg, triton.cdiv(n, 64))](words, w8, N=n, K=k, BLOCK_N=64, num_warps=4)
-    bm, bn, warps, stages = prefill8_config()
     out = torch.empty((m, n), dtype=torch.float32 if f32 else torch.bfloat16, device=x8.device)
+    if prefill8_kernel() == "hip":                    # the hand-issued fp8 WMMA (qmm8_rocm.cu); its own bits
+        _ext8().gemm8(x8, xs, a, w8, scales, biases, n, prefill8_group(), out, prefill8_variant())
+        return out
+    bm, bn, warps, stages = prefill8_config()
     _gemm8[(triton.cdiv(m, bm) * triton.cdiv(n, bn),)](x8, xs, a, w8, scales, biases, out, m, N=n, K=k, BM=bm, BN=bn,
                                                        KB=16, GROUP=prefill8_group(), num_warps=warps,
                                                        num_stages=stages)
