@@ -99,3 +99,12 @@ def test_bf16_head_rows_are_exact_and_row_count_invariant():
     assert ((whole.double() - ref).norm() / ref.norm()).item() < 1e-5   # fp32 sums over K
     for m in (1, 4, 12, 17, 32, 33, 48):
         assert torch.equal(kmx.b16(x[:m], w, f32=True), whole[:m]), m
+
+
+def test_host_table_rows_are_the_stored_rows():
+    table = torch.randn(5000, 5120).bfloat16().pin_memory()
+    ids = torch.tensor([[0, 4999, 17], [17, 3, 2500]], device="cuda")
+    got = kmx.host_rows(ids, table)
+    assert got.shape == (2, 3, 5120) and got.is_cuda
+    assert torch.equal(got.cpu(), table[ids.cpu()])
+    assert kmx.host_rows(torch.empty(0, dtype=torch.int64, device="cuda"), table).shape == (0, 5120)

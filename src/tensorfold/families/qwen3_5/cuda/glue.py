@@ -274,6 +274,10 @@ def embedding(ids: torch.Tensor, q) -> torch.Tensor:
     """Token rows: an EXL3 pack's table as stored, the MLX 4-bit table dequantized, or another affine table's."""
 
     if q.layout == "b16":
+        if not q.weight.is_cuda:                       # a table kept in pinned host memory (an MXFP4 checkpoint's)
+            from tensorfold.cuda.kernels.mx4 import host_rows
+
+            return host_rows(ids, q.weight)
         return q.weight[ids.to(torch.int64)].to(torch.bfloat16).contiguous()
     if q.layout == "gguf":
         return q.embed(ids)
