@@ -266,7 +266,7 @@ in pinned host memory. Other families, EXL3 packs and two ranks are refused at s
 [the recipe](docs/recipes/qwen3.8-27b.md#amd-gpus-rocm-experimental) for the MLX setup and limits.
 
 ```bash
-tensorfold serve /models/qwen3.8-27b-quark-awq-mxfp4 --drafter z-lab/Qwen3.8-27B-DFlash2 \
+tensorfold serve Qwen3.8-27B-Quark-AWQ-MXFP4 --drafter z-lab/Qwen3.8-27B-DFlash2 \
   --prefill-fp8 --kv-dtype fp8 --parallel 3 --ram-tier-gib 8
 ```
 
@@ -274,19 +274,19 @@ tensorfold serve /models/qwen3.8-27b-quark-awq-mxfp4 --drafter z-lab/Qwen3.8-27B
 `--ram-tier-gib` keeps the prompt states the GPU cache lets go in pinned host RAM and copies them back when a
 conversation returns, instead of prefilling again; the replies keep their bits either way.
 
-Measured on one R9700 on 2026-10-03 (commit `c2a313a`) with Qwen3.8-27B-Quark-AWQ-MXFP4, thinking off, two
-server starts (decode on this GPU varies from one process start to the next). vLLM-radiance 1.0.387 serves the same
-checkpoint on the same card with MTP drafts:
+Measured on one R9700 at its stock 300 W power limit on 2026-10-03 (commit `13625f6`) with the command above,
+thinking off, two server starts (decode on this GPU varies from one process start to the next):
 
-| | vLLM-radiance | TensorFold |
-| --- | --- | --- |
-| Prompt, 6.7K tokens | 2,588 tok/s | 2,656-2,678 tok/s |
-| Prompt, 30K tokens | - | 2,396-2,421 tok/s |
-| Prompt, 67K tokens | 2,066 tok/s | 1,896-1,915 tok/s |
-| Decode, chat, one client | 54.5 tok/s | 45-48 tok/s |
-| Decode, code, one client | 99.5 tok/s | 119-120 tok/s |
-| Two clients, total (first token, median) | 82.5 tok/s (3.4 s) | 85-93 tok/s (2.2 s) |
-| Three clients, total (first token, median) | 113.5 tok/s (5.9 s) | 95-104 tok/s (3.2 s) |
+| | TensorFold |
+| --- | --- |
+| Prompt, 6.7K tokens | 2,849-2,859 tok/s |
+| Prompt, 30K tokens | 2,635-2,645 tok/s |
+| Prompt, 67K tokens | 2,119-2,139 tok/s |
+| Decode, chat, one client | 49.0-49.1 tok/s |
+| Decode, code, one client | 125-128 tok/s |
+| One client, total (first token, median) | 70.6-71.1 tok/s (1.0 s) |
+| Two clients, total (first token, median) | 89-99 tok/s (1.9-2.0 s) |
+| Three clients, total (first token, median) | 96-112 tok/s (2.9 s) |
 
 With `--ram-tier-gib 8`, six 30K-token conversations served in turn take 0.22 s to a repeated turn's first token,
 against 13.2 s without it (the first turn: 12.8 s either way). The kernels credit vLLM-radiance and libr4d for ideas
