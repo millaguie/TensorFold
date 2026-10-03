@@ -251,6 +251,8 @@ def _serve_cuda(args: argparse.Namespace, family: Any, model_dir: Path, context:
                                "master_port": int(args.master_port), "no_drafts": bool(args.no_drafts)}
     if getattr(args, "kv_dtype", "bf16") != "bf16":
         options["kv_dtype"] = args.kv_dtype
+    if getattr(args, "ram_tier_gib", 0.0):
+        options["ram_tier_gib"] = float(args.ram_tier_gib)
     options.update(_vision_options(args))
     if args.mtp_drafts is not None:
         options["mtp_drafts"] = int(args.mtp_drafts)

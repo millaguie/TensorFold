@@ -108,23 +108,31 @@ def accept(tokens: Sequence[int], parents: Sequence[int], sampled: Sequence[int]
     return path, terminal
 
 
+def extended(prompt: Sequence[int], entries, ids: Callable[[Any], list[int]] = lambda e: e[0], than: int = -1):
+    """The longest entry the prompt strictly extends (one prompt token is always left to prefill) past ``than`` tokens
+    (default: any), the first of equals, or None; ``ids``: an entry's ids."""
+
+    best, most = None, than
+    for entry in entries:
+        got = ids(entry)
+        if most < len(got) < len(prompt) and list(prompt[:len(got)]) == got:
+            best, most = entry, len(got)
+    return best
+
+
 class PrefixCache:
     """Private prompt-end states by ids (never decoded rows: prefill and decode bits differ), newest last."""
 
-    def __init__(self, keep: int = 8) -> None:
+    def __init__(self, keep: int = 8, on_evict: Callable[[list[int], Any, Any], Any] | None = None) -> None:
         self.keep = keep
+        self.on_evict = on_evict                           # gets each entry that leaves, still intact (a host tier)
         self.entries: list[tuple[list[int], Any, Any]] = []
         self.hit: set[tuple[int, ...]] = set()             # entries a later prompt resumed from
 
     def longest(self, prompt: Sequence[int]):
         """The longest entry the prompt strictly extends (one prompt token is always left to prefill), now newest."""
 
-        best = None
-        for entry in self.entries:
-            ids = entry[0]
-            if len(ids) < len(prompt) and list(prompt[:len(ids)]) == ids and (best is None or len(ids) > len(best[0])):
-                best = entry
-        return self._touch(best)
+        return self._touch(extended(prompt, self.entries))
 
     def named(self, prompt: Sequence[int], length: int):
         """The entry holding the prompt's first ``length`` ids (a follower rank finds the leader's pick), now newest."""
@@ -158,9 +166,28 @@ class PrefixCache:
 
     def _drop(self, among: list) -> None:
         cold = [e for e in among if tuple(e[0]) not in self.hit]
-        gone = cold[0] if cold else among[0]
-        self.entries = [e for e in self.entries if e is not gone]
+        self._leave([cold[0] if cold else among[0]])
         self.hit &= {tuple(e[0]) for e in self.entries}
+
+    def clear(self) -> None:
+        """Every entry leaves, longest first (a host tier then stores the shorter ones as the longer's rows)."""
+
+        self._leave(sorted(self.entries, key=lambda e: -len(e[0])))
+        self.hit = set()
+
+    def drop(self, ids: Sequence[int]) -> None:
+        """Drop the entries that extend ``ids``: a state resumed from ``ids`` writes rows into buffers they share."""
+
+        n, ids = len(ids), list(ids)
+        self._leave([e for e in self.entries if len(e[0]) > n and e[0][:n] == ids])
+
+    def _leave(self, gone: list) -> None:
+        """Remove entries and hand them, oldest first, to ``on_evict`` while their rows are still intact."""
+
+        self.entries = [e for e in self.entries if all(e is not g for g in gone)]
+        if self.on_evict is not None:
+            for entry in gone:
+                self.on_evict(*entry)
 
 
 class KVRoom:

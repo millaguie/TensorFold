@@ -24,13 +24,14 @@ class Qwen27Engine:
 
     tree_rows: int | None = None       # a lone stream's tree rows on one GPU (None: max_rows, as in 0.5.0)
     room = None                        # one GPU's attention-cache budget (streams.KVRoom), None on two
+    tier = None                        # a HostTier: prompt states the GPU cache evicts, in host RAM (--ram-tier-gib)
 
     def __init__(self, model_dir: Path, draft_dir: Path | None, *, max_rows: int = 12, tp: int = 1,
                  rank: int = 0, master: str = "", port: int = 29551, split_head: bool = False,
                  tp_draft: bool = False, allow_copy: bool = True, streams: int = 1,
                  context: int | None = None, context_explicit: bool | None = None, vision: bool = False,
                  vision_urls: bool = False, tree_rows: int | None = None, keep: int | None = None,
-                 kv_fp8: bool = False):
+                 kv_fp8: bool = False, ram_tier: int = 0):
         import torch
 
         from tensorfold.cuda.nvfp4.format import is_quantized
@@ -67,6 +68,12 @@ class Qwen27Engine:
         if nvfp4 and vision:
             raise ValueError("image input on CUDA is tested on the MLX checkpoint only: drop --vision for an NVFP4 "
                              "checkpoint, or serve Vontra/Qwen3.8-27B-MLX-4bit")
+        if ram_tier and tp != 1:
+            raise ValueError("--ram-tier-gib keeps prompt states in one host's RAM for one GPU: drop it with --tp 2")
+        if ram_tier:                        # the serve command asked before downloading; a direct caller asks here
+            from tensorfold.cuda.capacity import refuse_ram_tier
+
+            refuse_ram_tier(ram_tier, torch)
         if kv_fp8:                          # packed FP8 keys and values: only ROCm's WMMA attention reads them
             if not gfx12():
                 raise ValueError("--kv-dtype fp8: FP8 keys and values run on ROCm's WMMA attention, written for RDNA4 "
@@ -205,6 +212,24 @@ class Qwen27Engine:
             self.room = KVRoom(self.cache, spare + live_kv(config(model_dir), 1, self.context_window, kv8=kv_fp8))
         # ``streams`` > 1: up to that many requests decoded together, their windows verified in one forward
         self.concurrent = streams > 1
+        self.tier = None
+        if ram_tier:                          # jkuepker's host-RAM tier (ashhart/TensorFold#106), without its window
+            from tensorfold.cuda.capacity import GIB
+            from tensorfold.cuda.host_tier import HostTier
+
+            self.tier = HostTier(ram_tier, self.w.norm.device)
+            if not self.concurrent:
+                self.cache.on_evict = self.tier.put
+            t0 = time.perf_counter()
+            pinned = self.tier.reserve()
+            print(f"[tensorfold] RAM tier: prompt states the GPU cache evicts go to up to {ram_tier / GIB:.1f} GiB "
+                  f"of host memory ({pinned / GIB:.1f} GiB pinned in {time.perf_counter() - t0:.1f}s) and come back "
+                  "over PCIe instead of prefilling again", flush=True)
+            fits = self.tier.rows_for(*self._state_bytes())
+            if fits < self.context_window:
+                print(f"[tensorfold] RAM tier: it holds prompt states of at most {max(0, fits):,} tokens, short of "
+                      f"the {self.context_window:,}-token window; longer ones are prefilled again when their "
+                      "conversation returns (raise --ram-tier-gib to keep them)", flush=True)
         self.multi = self.scheduler = None
         if self.concurrent:
             from tensorfold.cuda.scheduler import Scheduler
@@ -213,7 +238,7 @@ class Qwen27Engine:
 
             self.multi = MultiDecoder(self.w, self.draft, allow_copy=allow_copy, rank=rank, world=tp,
                                       context=self.capacity_plan["cache_slots"], keep=keep, points=self.points,
-                                      vision=self.vision)
+                                      vision=self.vision, tier=self.tier)
             self.multi.model_dir = self.model_dir             # rank 1 compiles a request's grammar from it
             self.multi.calibrate(streams)
             if rank == 0:
@@ -227,15 +252,36 @@ class Qwen27Engine:
 
     def _resume(self, prompt: list[int]):
         best = self.cache.longest(prompt)
-        if best is not None:
+        back = (self.tier.take(prompt, len(best[0]) if best else 0) if self.tier is not None else None)
+        if back is not None:                    # a longer match in host RAM: copied back into its own buffers
+            self.cache.add(*back)
+            best = self.cache.longest(prompt)
+        elif best is not None:
             self._drop_extensions(best[0])
+        if self.tier is not None:
+            self.tier.fence()                   # the prefill may write rows a spill is still copying
         return best
+
+    def _state_bytes(self) -> tuple[list[int], list[int]]:
+        """One prompt state in the RAM tier: the bytes of its tensors besides attention rows (DeltaNet state, and the
+        drafter's context at its longest), and each attention buffer's bytes a row. (jkuepker's.)"""
+
+        import math
+
+        from .forward import State
+
+        probe = State(self.w)
+        sizes = [t.numel() * t.element_size() for t in (*probe.conv, *probe.rec) if t is not None]
+        widths = [math.prod(t.shape[1:]) * t.element_size() for pair in probe.kv if pair is not None for t in pair]
+        d = self.draft
+        if d is not None:                   # keys and values of up to ``window`` rows a layer: bf16 fast, else fp32
+            sizes += [d.kv_local * d.window * d.head_dim * (2 if d.fast else 4)] * (2 * d.layers)
+        return sizes, widths
 
     def _drop_extensions(self, ids: list[int]) -> None:
         """Drop cached extensions before resuming a shorter prefix because cloned states share KV buffers and resumed writes overwrite longer prefixes."""
 
-        n = len(ids)
-        self.cache.entries = [c for c in self.cache.entries if len(c[0]) <= n or c[0][:n] != ids]
+        self.cache.drop(ids)
 
     def _remember(self, ids: list[int], st, snap) -> None:
         self.cache.add(ids, st, snap)
