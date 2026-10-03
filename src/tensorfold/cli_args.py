@@ -126,6 +126,9 @@ def build_parser(handlers: dict[str, Callable[[argparse.Namespace], int]]) -> ar
                            "fp16 scale per 32 values (Flash Next on CUDA); fp8 stores them as e4m3 with a "
                            "power-of-two scale per row, about half of bf16's bytes (Qwen3.8-27B on RDNA4). Each "
                            "changes outputs slightly")
+    cuda.add_argument("--ram-tier-gib", type=float, default=0.0,
+                      help="Qwen3.8-27B on one GPU: keep prompt states the GPU prefix cache evicts in up to this many "
+                           "GiB of host RAM and copy them back instead of prefilling again (0: off; MLX: --spill-gib)")
     cuda.add_argument("--prefill-fp8", action=argparse.BooleanOptionalAction, default=argparse.SUPPRESS,
                       help="prompt matmuls take FP8 (e4m3) activations, one scale a row, where the checkpoint has an "
                            "FP8 prompt kernel (Qwen3.8 27B and Qwen3.6 MLX 4-bit, NVFP4 checkpoints' FP8 and MXFP8 "

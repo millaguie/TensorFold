@@ -186,6 +186,25 @@ def host_stream_bytes() -> int | None:
     return max(0, memory["MemAvailable"] - reserve)
 
 
+def host_room() -> int | None:
+    """Host memory a process may still hold (MemAvailable less the host reserve); None: unknown."""
+
+    memory = _meminfo()
+    return None if memory is None else max(0, memory["MemAvailable"] - reserve_bytes(memory["MemTotal"], host=True))
+
+
+def refuse_ram_tier(nbytes: int, torch=None) -> None:
+    """Refuse a host-RAM tier (``--ram-tier-gib``) on a GPU that shares the host's memory (asked of ``torch`` when
+    given), or larger than the host can spare. (jkuepker's, from his host-RAM tier.)"""
+
+    if torch is not None and unified(torch):
+        raise ValueError("--ram-tier-gib: this GPU shares the host's memory, where its prefix cache already lives; "
+                         "drop it")
+    room = host_room()
+    if room is not None and nbytes > room:
+        raise ValueError(f"--ram-tier-gib {nbytes / GIB:.1f}: this host has {room / GIB:.1f} GiB to spare; ask for less")
+
+
 def available_bytes(torch) -> int:
     """The original unified-memory budget, or a discrete GPU's own budget; host staging is checked separately."""
 

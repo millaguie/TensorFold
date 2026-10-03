@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import inspect
+import math
 from typing import Any
 
 
@@ -46,6 +47,25 @@ def check(args: argparse.Namespace, family: Any, backend: str, config_dir: Any =
         if _cuda_streams(getattr(args, "parallel", "auto")) < 2:
             raise ValueError(f"--checkpoint-slots sets the prompt states {family.title}'s concurrent decoder keeps on "
                              "CUDA (--parallel 2 or more); one stream keeps 4, which share its attention buffer")
+    tier = getattr(args, "ram_tier_gib", 0.0) or 0.0
+    if not math.isfinite(tier) or tier < 0:
+        raise ValueError(f"--ram-tier-gib is a GiB count (0: off), not {tier}")
+    if tier and backend != "cuda":
+        raise ValueError("--ram-tier-gib keeps evicted prompt states in host RAM beside a CUDA GPU; on MLX, "
+                         "--spill-gib writes them to disk")
+    tier_engine = getattr(family.package, "cuda_engine", None) if backend == "cuda" else None
+    if tier and (tier_engine is None or "ram_tier_gib" not in inspect.signature(tier_engine).parameters):
+        raise ValueError(f"--ram-tier-gib: {family.title} on CUDA has no host RAM tier for its prompt states")
+    if tier and getattr(args, "tp", 1) != 1:
+        raise ValueError("--ram-tier-gib keeps prompt states in one host's RAM for one GPU: drop it with --tp 2")
+    if tier:                                        # the host's memory and the GPU's kind, before any download
+        from tensorfold.cuda.capacity import GIB, refuse_ram_tier
+
+        try:
+            import torch
+        except ImportError:                         # the CUDA engine names a missing torch itself
+            torch = None
+        refuse_ram_tier(int(tier * GIB), torch)
     fp8 = getattr(family.package, "CUDA_PREFILL_FP8", False) and backend == "cuda"
     if getattr(args, "prefill_fp8", None) and not fp8:              # asked for by name, not a default
         raise ValueError(f"--prefill-fp8 picks FP8 prompt kernels on CUDA; {family.title} on "
