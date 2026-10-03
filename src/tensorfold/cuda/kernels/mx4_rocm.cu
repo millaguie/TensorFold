@@ -202,7 +202,6 @@ __device__ __forceinline__ short8 wfrag(const uint4& g, int s, int h, unsigned s
 }
 
 constexpr int DGS = 16;                                  // groups (512 inputs) staged a step
-constexpr int AHEAD = 8;                                 // groups whose weights load together
 
 template <int MT>
 __global__ void __launch_bounds__(256) decode_kernel(
@@ -229,31 +228,18 @@ __global__ void __launch_bounds__(256) decode_kernel(
             *reinterpret_cast<uint2*>(&xl[row][pc * 8 + 4]) = make_uint2(v.z, v.w);
         }
         __syncthreads();
-        // AHEAD groups' words and scales loaded at once, then their WMMAs: more reads in flight (memory bound)
-        const uint8_t* wcol = wt + (static_cast<size_t>(colc >> 4) * kg * 16 + (colc & 15)) * 16;
-        for (int j0 = 0; j0 < groups; j0 += AHEAD) {
-            uint4 gw[AHEAD];
-            int sc[AHEAD];
+        for (int j = 0; j < groups; ++j) {
+            const int g = gb + j;
+            const uint4 gw = *reinterpret_cast<const uint4*>(wt + ((static_cast<size_t>(colc >> 4) * kg + g) * 16 + (colc & 15)) * 16);
+            const unsigned d = static_cast<unsigned>(r - static_cast<int>(sct[static_cast<size_t>(g) * n + colc]));
+            const unsigned shift = (d << 7) | (d << 23);
 #pragma unroll
-            for (int u = 0; u < AHEAD; ++u) {
-                const int g = gb + min(j0 + u, groups - 1);   // past the step: its last group again (unused)
-                gw[u] = *reinterpret_cast<const uint4*>(wcol + static_cast<size_t>(g) * 256);
-                sc[u] = sct[static_cast<size_t>(g) * n + colc];
-            }
+            for (int s = 0; s < 2; ++s) {
+                const short8 b = wfrag(gw, s, h, shift);
 #pragma unroll
-            for (int u = 0; u < AHEAD; ++u) {
-                if (j0 + u >= groups) break;
-                const int j = j0 + u;
-                const unsigned d = static_cast<unsigned>(r - sc[u]);
-                const unsigned shift = (d << 7) | (d << 23);
-#pragma unroll
-                for (int s = 0; s < 2; ++s) {
-                    const short8 b = wfrag(gw[u], s, h, shift);
-#pragma unroll
-                    for (int t = 0; t < MT; ++t) {
-                        const short8 av = *reinterpret_cast<const short8*>(&xl[16 * t + c][j * 32 + 16 * s + 8 * h]);
-                        acc[t] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(av, b, acc[t]);
-                    }
+                for (int t = 0; t < MT; ++t) {
+                    const short8 av = *reinterpret_cast<const short8*>(&xl[16 * t + c][j * 32 + 16 * s + 8 * h]);
+                    acc[t] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(av, b, acc[t]);
                 }
             }
         }
