@@ -203,11 +203,69 @@ __device__ __forceinline__ short8 wfrag(const uint4& g, int s, int h, unsigned s
 
 constexpr int DGS = 16;                                  // groups (512 inputs) staged a step
 
+// A slice's sums, and the column block's last slice to arrive adds every slice in slice order (reduce_kernel's
+// arithmetic, so the same bits) and writes the outputs; counts[block] returns to zero for the next call. One launch a
+// matmul instead of two (the idea is jkuepker's wmma_kernel in qmm_rocm.cu).
+template <int MT>
+__device__ __forceinline__ void finish(const float8 (&acc)[MT], float cs, bool live, int col, int m, int n, int slice,
+                                       int slices, float* __restrict__ part, unsigned short* __restrict__ out16,
+                                       float* __restrict__ out32, int* __restrict__ counts) {
+    __shared__ int last;
+    const int lane = threadIdx.x & 31, h = lane >> 4;
+    if (slices == 1) {
+        if (!live) return;
+#pragma unroll
+        for (int t = 0; t < MT; ++t)
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const int row = 16 * t + 8 * h + i;
+                if (row >= m) break;
+                const float v = acc[t][i] * cs;
+                if (out32 != nullptr) out32[static_cast<size_t>(row) * n + col] = v;
+                else out16[static_cast<size_t>(row) * n + col] = bf16_round(v);
+            }
+        return;
+    }
+    if (live) {
+#pragma unroll
+        for (int t = 0; t < MT; ++t)
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const int row = 16 * t + 8 * h + i;
+                if (row >= m) break;
+                part[(static_cast<size_t>(slice) * m + row) * n + col] = acc[t][i] * cs;
+            }
+    }
+    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
+    __syncthreads();
+    if (threadIdx.x == 0) last = atomicAdd(&counts[blockIdx.x], 1) == slices - 1;
+    __syncthreads();
+    if (!last) return;
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+    if (live) {
+#pragma unroll
+        for (int t = 0; t < MT; ++t)
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const int row = 16 * t + 8 * h + i;
+                if (row >= m) break;
+                float v = __hip_atomic_load(&part[static_cast<size_t>(row) * n + col], __ATOMIC_RELAXED,
+                                            __HIP_MEMORY_SCOPE_AGENT);
+                for (int u = 1; u < slices; ++u)
+                    v = v + __hip_atomic_load(&part[(static_cast<size_t>(u) * m + row) * n + col], __ATOMIC_RELAXED,
+                                              __HIP_MEMORY_SCOPE_AGENT);
+                if (out32 != nullptr) out32[static_cast<size_t>(row) * n + col] = v;
+                else out16[static_cast<size_t>(row) * n + col] = bf16_round(v);
+            }
+    }
+    if (threadIdx.x == 0) counts[blockIdx.x] = 0;
+}
+
 template <int MT>
 __global__ void __launch_bounds__(256) decode_kernel(
         const unsigned short* __restrict__ x, int m, const uint8_t* __restrict__ wt, const uint8_t* __restrict__ sct,
         const int* __restrict__ ref, int n, int ldn, int k, int gps, float* __restrict__ part,
-        unsigned short* __restrict__ out16, float* __restrict__ out32, int slices) {
+        unsigned short* __restrict__ out16, float* __restrict__ out32, int slices, int* __restrict__ counts) {
     __shared__ __align__(16) unsigned short xl[MT * 16][DGS * 32 + 8];
     const int kg = k / 32, slice = blockIdx.y, g0 = slice * gps, g1 = min(kg, g0 + gps);
     const int lane = threadIdx.x & 31, wave = threadIdx.x >> 5, h = lane >> 4, c = lane & 15;
@@ -244,19 +302,7 @@ __global__ void __launch_bounds__(256) decode_kernel(
             }
         }
     }
-    if (col >= n) return;
-    const float cs = __int_as_float(r << 23);
-#pragma unroll
-    for (int t = 0; t < MT; ++t)
-#pragma unroll
-        for (int i = 0; i < 8; ++i) {
-            const int row = 16 * t + 8 * h + i;
-            if (row >= m) break;
-            const float v = acc[t][i] * cs;
-            if (slices > 1) part[(static_cast<size_t>(slice) * m + row) * n + col] = v;
-            else if (out32 != nullptr) out32[static_cast<size_t>(row) * n + col] = v;
-            else out16[static_cast<size_t>(row) * n + col] = bf16_round(v);
-        }
+    finish<MT>(acc, __int_as_float(r << 23), col < n, col, m, n, slice, slices, part, out16, out32, counts);
 }
 
 // ``b16_kernel``: the same rows times a bf16 (N, K) weight as stored (the MXFP4 checkpoint's head; the drafter's rows
@@ -264,7 +310,8 @@ __global__ void __launch_bounds__(256) decode_kernel(
 template <int MT>
 __global__ void __launch_bounds__(256) b16_kernel(
         const unsigned short* __restrict__ x, int m, const unsigned short* __restrict__ wb, int n, int k, int gps,
-        float* __restrict__ part, unsigned short* __restrict__ out16, float* __restrict__ out32, int slices) {
+        float* __restrict__ part, unsigned short* __restrict__ out16, float* __restrict__ out32, int slices,
+        int* __restrict__ counts) {
     __shared__ __align__(16) unsigned short xl[MT * 16][DGS * 32 + 8];
     const int kg = k / 32, slice = blockIdx.y, g0 = slice * gps, g1 = min(kg, g0 + gps);
     const int lane = threadIdx.x & 31, wave = threadIdx.x >> 5, h = lane >> 4, c = lane & 15;
@@ -298,18 +345,7 @@ __global__ void __launch_bounds__(256) b16_kernel(
             }
         }
     }
-    if (col >= n) return;
-#pragma unroll
-    for (int t = 0; t < MT; ++t)
-#pragma unroll
-        for (int i = 0; i < 8; ++i) {
-            const int row = 16 * t + 8 * h + i;
-            if (row >= m) break;
-            const float v = acc[t][i];
-            if (slices > 1) part[(static_cast<size_t>(slice) * m + row) * n + col] = v;
-            else if (out32 != nullptr) out32[static_cast<size_t>(row) * n + col] = v;
-            else out16[static_cast<size_t>(row) * n + col] = bf16_round(v);
-        }
+    finish<MT>(acc, 1.0f, col < n, col, m, n, slice, slices, part, out16, out32, counts);
 }
 
 __global__ void reduce_kernel(const float* __restrict__ part, int slices, size_t total, float* __restrict__ out32,
@@ -359,7 +395,7 @@ int decode_slices(int n, int kg) {
 
 // x: (M, K) bf16 rows, M <= 32; out: (M, N) bf16 or fp32; part: (slices, M, N) fp32 scratch.
 void decode_mx4(const at::Tensor& x, const at::Tensor& wt, const at::Tensor& sct, const at::Tensor& ref, int n,
-                at::Tensor& out, at::Tensor& part) {
+                at::Tensor& out, at::Tensor& part, at::Tensor& counts) {
     const int m = static_cast<int>(x.size(0)), k = static_cast<int>(x.size(1)), kg = k / 32;
     TORCH_CHECK(m <= 32 && k % 32 == 0 && x.scalar_type() == at::kBFloat16 && x.is_contiguous() && out.is_contiguous(),
                 "decode_mx4: up to 32 contiguous bf16 rows, K a multiple of 32");
@@ -376,18 +412,14 @@ void decode_mx4(const at::Tensor& x, const at::Tensor& wt, const at::Tensor& sct
     const auto* xp = reinterpret_cast<const unsigned short*>(x.data_ptr());
     if (m <= 16)
         decode_kernel<1><<<grid, 256, 0, stream>>>(xp, m, wt.data_ptr<uint8_t>(), sct.data_ptr<uint8_t>(),
-                                                   ref.data_ptr<int>(), n, ldn, k, gps, part.data_ptr<float>(), o16, o32, slices);
+                                                   ref.data_ptr<int>(), n, ldn, k, gps, part.data_ptr<float>(), o16, o32, slices, counts.data_ptr<int>());
     else
         decode_kernel<2><<<grid, 256, 0, stream>>>(xp, m, wt.data_ptr<uint8_t>(), sct.data_ptr<uint8_t>(),
-                                                   ref.data_ptr<int>(), n, ldn, k, gps, part.data_ptr<float>(), o16, o32, slices);
-    if (slices > 1) {
-        const size_t total = static_cast<size_t>(m) * n;
-        reduce_kernel<<<(total + 255) / 256, 256, 0, stream>>>(part.data_ptr<float>(), slices, total, o32, o16);
-    }
+                                                   ref.data_ptr<int>(), n, ldn, k, gps, part.data_ptr<float>(), o16, o32, slices, counts.data_ptr<int>());
 }
 
 // x: (M, K) bf16 rows, M <= 32; w: (N, K) bf16 as stored; out and part as decode_mx4's.
-void decode_b16(const at::Tensor& x, const at::Tensor& w, at::Tensor& out, at::Tensor& part) {
+void decode_b16(const at::Tensor& x, const at::Tensor& w, at::Tensor& out, at::Tensor& part, at::Tensor& counts) {
     const int m = static_cast<int>(x.size(0)), k = static_cast<int>(x.size(1)), n = static_cast<int>(w.size(0));
     TORCH_CHECK(m <= 32 && k % 32 == 0 && w.size(1) == k && x.scalar_type() == at::kBFloat16 &&
                 w.scalar_type() == at::kBFloat16 && x.is_contiguous() && w.is_contiguous() && out.is_contiguous(),
@@ -402,12 +434,8 @@ void decode_b16(const at::Tensor& x, const at::Tensor& w, at::Tensor& out, at::T
     const auto* xp = reinterpret_cast<const unsigned short*>(x.data_ptr());
     const auto* wp = reinterpret_cast<const unsigned short*>(w.data_ptr());
     if (m <= 16) {                                       // braces: torch's hipify mangles an else-line launch
-        b16_kernel<1><<<grid, 256, 0, stream>>>(xp, m, wp, n, k, gps, part.data_ptr<float>(), o16, o32, slices);
+        b16_kernel<1><<<grid, 256, 0, stream>>>(xp, m, wp, n, k, gps, part.data_ptr<float>(), o16, o32, slices, counts.data_ptr<int>());
     } else {
-        b16_kernel<2><<<grid, 256, 0, stream>>>(xp, m, wp, n, k, gps, part.data_ptr<float>(), o16, o32, slices);
-    }
-    if (slices > 1) {
-        const size_t total = static_cast<size_t>(m) * n;
-        reduce_kernel<<<(total + 255) / 256, 256, 0, stream>>>(part.data_ptr<float>(), slices, total, o32, o16);
+        b16_kernel<2><<<grid, 256, 0, stream>>>(xp, m, wp, n, k, gps, part.data_ptr<float>(), o16, o32, slices, counts.data_ptr<int>());
     }
 }

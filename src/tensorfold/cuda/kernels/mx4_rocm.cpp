@@ -5,9 +5,9 @@ void prompt_mx4(const at::Tensor& x8, const at::Tensor& a, const at::Tensor& wt,
                 const at::Tensor& ref, int n, at::Tensor& out, int tn);
 
 void decode_mx4(const at::Tensor& x, const at::Tensor& wt, const at::Tensor& sct, const at::Tensor& ref, int n,
-                at::Tensor& out, at::Tensor& part);
+                at::Tensor& out, at::Tensor& part, at::Tensor& counts);
 int decode_slices(int n, int kg);
-void decode_b16(const at::Tensor& x, const at::Tensor& w, at::Tensor& out, at::Tensor& part);
+void decode_b16(const at::Tensor& x, const at::Tensor& w, at::Tensor& out, at::Tensor& part, at::Tensor& counts);
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("decode", &decode_mx4, "up to 32 bf16 rows times MXFP4 weights on bf16 WMMA, row-count invariant");

@@ -13,7 +13,7 @@ def _ext():
     from tensorfold.cuda.build import load
 
     here = Path(__file__).parent
-    return load(name="tensorfold_mx4_rocm_v9", sources=[str(here / "mx4_rocm.cpp"), str(here / "mx4_rocm.cu")],
+    return load(name="tensorfold_mx4_rocm_v10", sources=[str(here / "mx4_rocm.cpp"), str(here / "mx4_rocm.cu")],
                 extra_cuda_cflags=["-O3", "--fmad=false"], verbose=False)
 
 
@@ -47,6 +47,20 @@ def prompt(x: tuple[torch.Tensor, torch.Tensor, torch.Tensor], tiles: torch.Tens
 _parts: dict[torch.device, torch.Tensor] = {}
 
 
+_counts: dict[torch.device, torch.Tensor] = {}
+
+
+def _count(device: torch.device, n: int) -> torch.Tensor:
+    """Arrival counters, one a 128-column block, zero between calls (the last slice of a block resets its own)."""
+
+    c = _counts.get(device)
+    blocks = (n + 127) // 128
+    if c is None or c.numel() < blocks:
+        c = torch.zeros(max(blocks, 2048), dtype=torch.int32, device=device)
+        _counts[device] = c
+    return c
+
+
 def _part(device: torch.device, need: int) -> torch.Tensor:
     part = _parts.get(device)
     if part is None or part.numel() < need:
@@ -65,7 +79,7 @@ def decode(x: torch.Tensor, tiles: torch.Tensor, scales_t: torch.Tensor, ref: to
     ext = _ext()
     part = _part(x.device, ext.decode_slices(n, k // 32) * min(m, 32) * n)
     for a in range(0, m, 32):
-        ext.decode(x[a:a + 32], tiles, scales_t, ref, n, out[a:a + 32], part)
+        ext.decode(x[a:a + 32], tiles, scales_t, ref, n, out[a:a + 32], part, _count(x.device, n))
     return out
 
 
@@ -79,5 +93,5 @@ def b16(x: torch.Tensor, weight: torch.Tensor, *, f32: bool = False) -> torch.Te
     ext = _ext()
     part = _part(x.device, ext.decode_slices(n, k // 32) * min(m, 32) * n)
     for a in range(0, m, 32):
-        ext.decode_b16(x[a:a + 32], weight, out[a:a + 32], part)
+        ext.decode_b16(x[a:a + 32], weight, out[a:a + 32], part, _count(x.device, n))
     return out
