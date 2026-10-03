@@ -42,6 +42,7 @@ GLM-5.3-Flash images run on MLX; dense Qwen's run on MLX and CUDA. See
 | Qwen3.8 Flash Next (EXL3, experimental) | `turboderp/Qwen3.8-Flash-Next-exl3` (branch `3.05bpw_h5_ng5`; any codebook, a width per tensor) | CUDA | Included MTP head and context copies |
 | Ternary Bonsai 2 27B | `prism-ml/Ternary-Bonsai-2-27B-mlx-2bit` | MLX | `z-lab/Qwen3.8-27B-DFlash2` and context copies |
 | Qwen3.8 Flash Next (NVFP4) | `local-inference-lab/Qwen3.8-Flash-Next-NVFP4` (ModelOpt: NVFP4 experts, MXFP8 attention and DeltaNet); `RadixArk/Qwen3.8-Flash-Next-NVFP4` (bf16 besides the experts) | CUDA, one GPU | Included MTP head and context copies |
+| Qwen3.8-27B (MXFP4, AMD) | A Quark MXFP4 export of `Qwen/Qwen3.8-27B` such as Qwen3.8-27B-Quark-AWQ-MXFP4 (groups of 32, e8m0 scales, bf16 embedding and head) | ROCm, one RDNA4 GPU | `z-lab/Qwen3.8-27B-DFlash2` and context copies |
 
 `tensorfold models` lists families and checkpoints. `tensorfold info MODEL` checks configuration without
 fetching weights. `serve` downloads a missing checkpoint; `pull` downloads it ahead of time.
@@ -258,10 +259,39 @@ model data; the startup estimate is not a measured maximum capacity.
 
 ## AMD GPUs (experimental)
 
-On ROCm the same backend serves Qwen3.8-27B's MLX checkpoint on one GPU, with DFlash2 drafts: kernels build with
-hipcc for the GPU present, and the 4-bit matmuls take ROCm kernels of their own. Other families, EXL3 packs and
-two ranks are refused at startup. See [the recipe](docs/recipes/qwen3.8-27b.md#amd-gpus-rocm-experimental) for the
-setup, measurements and limits.
+On ROCm the same backend serves Qwen3.8-27B on one GPU, with DFlash2 drafts: kernels build with hipcc for the GPU
+present. It reads the MLX 4-bit checkpoint and, on RDNA4 (gfx1201, Radeon AI PRO R9700), a Quark MXFP4 export: its
+prompts run on FP8 WMMA with the weight scales folded into e4m3, its decode on bf16 WMMA, and its bf16 embedding stays
+in pinned host memory. Other families, EXL3 packs and two ranks are refused at startup. See
+[the recipe](docs/recipes/qwen3.8-27b.md#amd-gpus-rocm-experimental) for the MLX setup and limits.
+
+```bash
+tensorfold serve /models/qwen3.8-27b-quark-awq-mxfp4 --drafter z-lab/Qwen3.8-27B-DFlash2 \
+  --prefill-fp8 --kv-dtype fp8 --parallel 3 --ram-tier-gib 8
+```
+
+`--kv-dtype fp8` keeps keys and values in about half the bytes. `--parallel 3` decodes three requests in one forward.
+`--ram-tier-gib` keeps the prompt states the GPU cache lets go in pinned host RAM and copies them back when a
+conversation returns, instead of prefilling again; the replies keep their bits either way.
+
+Measured on one R9700 on 2026-10-03 (commit `c2a313a`) with Qwen3.8-27B-Quark-AWQ-MXFP4, thinking off, two
+server starts (decode on this GPU varies from one process start to the next). vLLM-radiance 1.0.387 serves the same
+checkpoint on the same card with MTP drafts:
+
+| | vLLM-radiance | TensorFold |
+| --- | --- | --- |
+| Prompt, 6.7K tokens | 2,588 tok/s | 2,656-2,678 tok/s |
+| Prompt, 30K tokens | - | 2,396-2,421 tok/s |
+| Prompt, 67K tokens | 2,066 tok/s | 1,896-1,915 tok/s |
+| Decode, chat, one client | 54.5 tok/s | 45-48 tok/s |
+| Decode, code, one client | 99.5 tok/s | 119-120 tok/s |
+| Two clients, total (first token, median) | 82.5 tok/s (3.4 s) | 85-93 tok/s (2.2 s) |
+| Three clients, total (first token, median) | 113.5 tok/s (5.9 s) | 95-104 tok/s (3.2 s) |
+
+With `--ram-tier-gib 8`, six 30K-token conversations served in turn take 0.22 s to a repeated turn's first token,
+against 13.2 s without it (the first turn: 12.8 s either way). The kernels credit vLLM-radiance and libr4d for ideas
+(no code: neither carries a license), jkuepker (#100, #106) and ThinkOffApp (#144); see
+[third-party notices](THIRD_PARTY_NOTICES.md).
 
 ## Measurements
 
