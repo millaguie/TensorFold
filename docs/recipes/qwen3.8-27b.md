@@ -307,10 +307,11 @@ head size 256, one rank and the WMMA attention kernels: startup refuses it on NV
 Limits: one rank; other families and EXL3 packs are refused. `--parallel 3` was run on an R9700 with three
 48K-token streams (with `--kv-dtype fp8`; each reply equal to its solo run).
 
-Known issue, still open: with `--parallel` near full VRAM, PyTorch's expandable segments gave NaN on ROCm (values
-changed after kernels had finished: a matmul output read non-finite and then finite, nothing launched between). The
-same requests run clean on plain segments, so ROCm starts without them; the cause is not found. `TF_EXPANDABLE_SEGMENTS=1`
-or `0` overrides that default on either backend. Verify windows
+With `--parallel` near full VRAM, a `torch.cuda.empty_cache()` between rounds unmapped and remapped pages inside
+live expandable segments on ROCm, and values changed under finished kernels (NaN, nothing in `dmesg`): three
+48K-token streams failed 4 of 6 replies with those trims and none without them. The memory gate already counts the
+allocator's freed bytes as free, so on a dedicated ROCm GPU the concurrent decoder never trims mid-round
+(`MultiDecoder.trims`); expandable segments stay on. `TF_EXPANDABLE_SEGMENTS=0` turns them off. Verify windows
 past 16 rows run the two-tile matmul, about a quarter slower than one tile: 16 rows helped code prompts (+13-19%)
 and hurt prose (-9%) in one test each, so `max_rows` stays 12.
 
