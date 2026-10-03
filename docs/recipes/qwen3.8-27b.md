@@ -310,8 +310,13 @@ Limits: one rank; other families and EXL3 packs are refused. `--parallel 3` was 
 With `--parallel` near full VRAM, a `torch.cuda.empty_cache()` between rounds unmapped and remapped pages inside
 live expandable segments on ROCm, and values changed under finished kernels (NaN, nothing in `dmesg`): three
 48K-token streams failed 4 of 6 replies with those trims and none without them. The memory gate already counts the
-allocator's freed bytes as free, so on a dedicated ROCm GPU the concurrent decoder never trims mid-round
-(`MultiDecoder.trims`); expandable segments stay on. `TF_EXPANDABLE_SEGMENTS=0` turns them off. Verify windows
+allocator's freed bytes as free. The allocator also unmaps expandable pages by itself under pressure, and a
+stand-alone PyTorch script corrupts memory or faults on two R9700s that way (illegal instructions, GPU page faults),
+so ROCm keeps plain segments, and with them the trims: on plain segments a trim only frees whole empty segments, and
+without trims three 48K-token streams ran out of memory with 2.9 GiB reserved in pieces (2 of 4 runs). With
+`TF_EXPANDABLE_SEGMENTS=1` on ROCm the concurrent decoder skips the trims (`MultiDecoder.trims`). Tracked in
+[pytorch/pytorch#195202](https://github.com/pytorch/pytorch/issues/195202); when it is fixed, expandable segments
+(and their trims) can come back on ROCm. Verify windows
 past 16 rows run the two-tile matmul, about a quarter slower than one tile: 16 rows helped code prompts (+13-19%)
 and hurt prose (-9%) in one test each, so `max_rows` stays 12.
 

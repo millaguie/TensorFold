@@ -25,6 +25,7 @@ class Qwen27Engine:
     tree_rows: int | None = None       # a lone stream's tree rows on one GPU (None: max_rows, as in 0.5.0)
     room = None                        # one GPU's attention-cache budget (streams.KVRoom), None on two
     tier = None                        # a HostTier: prompt states the GPU cache evicts, in host RAM (--ram-tier-gib)
+    growable = False                   # PyTorch's expandable segments, set for --parallel (not on ROCm: #195202)
 
     def __init__(self, model_dir: Path, draft_dir: Path | None, *, max_rows: int = 12, tp: int = 1,
                  rank: int = 0, master: str = "", port: int = 29551, split_head: bool = False,
@@ -91,6 +92,7 @@ class Qwen27Engine:
                 raise ValueError(f"--kv-dtype fp8 packs rows of 256 values for the WMMA kernels, not head size {dim}")
         from .weights import load
         from tensorfold.cuda.capacity import admit, config, gather_ints, total_bytes
+        from tensorfold.cuda.capacity import unified as capacity_unified
         from tensorfold.cuda.geometry import (draft_geometry, gdn_geometry, live_kv, prompt_row_bytes, prompt_rows,
                                               stream_geometry)
         from .affine_memory import draft_weights, weight_transform
@@ -102,9 +104,12 @@ class Qwen27Engine:
         self.vision = None
         self.vision_enabled = bool(vision)
         torch.cuda.set_device(0)
-        # streams' caches of many sizes come and go: growable segments, less slack (on ROCm the concurrent decoder
-        # then never trims them mid-round: see MultiDecoder.trims). TF_EXPANDABLE_SEGMENTS=0 turns them off.
-        if streams > 1 and tp == 1 and os.environ.get("TF_EXPANDABLE_SEGMENTS", "1") == "1":
+        # streams' caches of many sizes come and go: growable segments, less slack. Not on ROCm: unmapping their pages
+        # under queued work corrupts memory there (gfx1201, ROCm 7.14), whether empty_cache() or the allocator itself
+        # unmaps (pytorch/pytorch#195202). When that issue is fixed, drop the hip() case here (and, if wanted, the
+        # trims MultiDecoder skips with them). TF_EXPANDABLE_SEGMENTS=1 or 0 overrides the default on any backend.
+        self.growable = streams > 1 and tp == 1 and os.environ.get("TF_EXPANDABLE_SEGMENTS", "0" if hip() else "1") == "1"
+        if self.growable:
             torch.cuda.memory._set_allocator_settings("expandable_segments:True")
         keep = KEEP if keep is None else int(keep)         # --checkpoint-slots: each kept state is in the estimate
         if tp == 2:
@@ -240,7 +245,8 @@ class Qwen27Engine:
 
             self.multi = MultiDecoder(self.w, self.draft, allow_copy=allow_copy, rank=rank, world=tp,
                                       context=self.capacity_plan["cache_slots"], keep=keep, points=self.points,
-                                      vision=self.vision, tier=self.tier)
+                                      vision=self.vision, tier=self.tier,
+                                      trims=not (self.growable and hip() and not capacity_unified(torch)))
             self.multi.model_dir = self.model_dir             # rank 1 compiles a request's grammar from it
             self.multi.calibrate(streams)
             if rank == 0:
