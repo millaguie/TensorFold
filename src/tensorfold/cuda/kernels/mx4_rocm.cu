@@ -349,10 +349,11 @@ __global__ void __launch_bounds__(256) b16_kernel(
 }
 
 // Token rows of a bf16 table kept in pinned host memory (the MXFP4 checkpoint's embedding): each block copies one
-// row over PCIe through the mapped host pointer, 16 bytes a thread. Bits as stored; no host synchronisation.
-__global__ void host_rows_kernel(const uint4* __restrict__ table, const int64_t* __restrict__ ids, int64_t pieces,
-                                 uint4* __restrict__ out) {
-    const int64_t row = ids[blockIdx.x];
+// row over PCIe through the mapped host pointer, 16 bytes a thread. Bits as stored; no host synchronisation; an id
+// outside the table reads its nearest row instead of host memory past it.
+__global__ void host_rows_kernel(const uint4* __restrict__ table, const int64_t* __restrict__ ids, int64_t rows,
+                                 int64_t pieces, uint4* __restrict__ out) {
+    const int64_t row = min(max(ids[blockIdx.x], static_cast<int64_t>(0)), rows - 1);   // never a read past the table
     for (int64_t i = threadIdx.x; i < pieces; i += blockDim.x)
         out[static_cast<int64_t>(blockIdx.x) * pieces + i] = table[row * pieces + i];
 }
@@ -470,5 +471,6 @@ void host_rows(const at::Tensor& table, const at::Tensor& ids, at::Tensor& out) 
     TORCH_CHECK(hipHostGetDevicePointer(&mapped, table.data_ptr(), 0) == hipSuccess, "host_rows: table not mapped");
     const int64_t pieces = table.size(1) * 2 / 16;
     host_rows_kernel<<<static_cast<unsigned>(ids.numel()), 256, 0, at::cuda::getCurrentCUDAStream()>>>(
-        reinterpret_cast<const uint4*>(mapped), ids.data_ptr<int64_t>(), pieces, reinterpret_cast<uint4*>(out.data_ptr()));
+        reinterpret_cast<const uint4*>(mapped), ids.data_ptr<int64_t>(), table.size(0), pieces,
+        reinterpret_cast<uint4*>(out.data_ptr()));
 }
