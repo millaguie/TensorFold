@@ -62,6 +62,12 @@ class Plain:
         return self.weight.numel() * self.weight.element_size()
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        from tensorfold.cuda.build import gfx12
+
+        if gfx12() and self.weight.dtype == torch.bfloat16 and self.k % 32 == 0:   # RDNA4: bf16 WMMA, row invariant
+            from tensorfold.cuda.kernels.mx4 import b16
+
+            return b16(x, self.weight)
         from .b16 import matmul
 
         return matmul(x, self.weight)

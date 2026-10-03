@@ -43,6 +43,12 @@ class Qwen27Engine:
         exl3 = quant_config(Path(model_dir)) is not None
         gguf = not exl3 and gguf_file(Path(model_dir)) is not None
         nvfp4 = not exl3 and not gguf and is_quantized(Path(model_dir))
+        from .mx4_load import quark_mxfp4
+
+        mx4 = not (exl3 or gguf or nvfp4) and quark_mxfp4(Path(model_dir))
+        if mx4 and not gfx12():           # its kernels are RDNA4's (fp8 and bf16 WMMA, fragment-ordered prompts)
+            raise ValueError("Quark MXFP4 checkpoints run on RDNA4 GPUs (gfx12, ROCm): elsewhere serve the MLX "
+                             "checkpoint (Vontra/Qwen3.8-27B-MLX-4bit)")
         if gguf and not hip():             # Gufo's kernels are HIP only: say so before building them
             raise ValueError("GGUF files of Qwen3.8-27B run on AMD GPUs (ROCm, Gufo's kernels); on NVIDIA serve "
                              "the MLX checkpoint (Vontra/Qwen3.8-27B-MLX-4bit), an NVFP4 or an EXL3 one")
@@ -123,8 +129,12 @@ class Qwen27Engine:
                     else (lambda text: gdn_geometry(text, tp, max_rows, rows=max_rows, prompt=chunk, evicts=tp == 1,
                                                     kv8=kv_fp8)))
         # an affine checkpoint's packed words at their stored precision; an EXL3 pack's by its own format
-        tensor_bytes = weight_transform(model_dir, one_gpu=tp == 1)
-        if gguf:
+        tensor_bytes = weight_transform(model_dir, one_gpu=tp == 1) if not mx4 else None
+        if mx4:
+            from .mx4_load import weight_bytes as mx4_bytes
+
+            tensor_bytes = mx4_bytes
+        elif gguf:
             from .gguf_load import weight_bytes
             from .weights import Config
 
@@ -150,7 +160,7 @@ class Qwen27Engine:
         if tp == 2:
             full = load(model_dir)
             self.w = split_weights(full, rank, tiled=True, split_head=split_head)
-        elif gfx12() and not gguf:                 # RDNA4: [gate|up], [z|b|a] and [k|v] fused, members as views
+        elif gfx12() and not (gguf or mx4):        # RDNA4: [gate|up], [z|b|a] and [k|v] fused, members as views
             from .qmm_fast import prepare
 
             full = load(model_dir)
