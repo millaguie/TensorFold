@@ -393,12 +393,12 @@ int decode_slices(int n, int kg) {
     return slices;
 }
 
-// x: (M, K) bf16 rows, M <= 32; out: (M, N) bf16 or fp32; part: (slices, M, N) fp32 scratch.
+// x: (M, K) bf16 rows, M <= 48; out: (M, N) bf16 or fp32; part: (slices, M, N) fp32 scratch.
 void decode_mx4(const at::Tensor& x, const at::Tensor& wt, const at::Tensor& sct, const at::Tensor& ref, int n,
                 at::Tensor& out, at::Tensor& part, at::Tensor& counts) {
     const int m = static_cast<int>(x.size(0)), k = static_cast<int>(x.size(1)), kg = k / 32;
-    TORCH_CHECK(m <= 32 && k % 32 == 0 && x.scalar_type() == at::kBFloat16 && x.is_contiguous() && out.is_contiguous(),
-                "decode_mx4: up to 32 contiguous bf16 rows, K a multiple of 32");
+    TORCH_CHECK(m <= 48 && k % 32 == 0 && x.scalar_type() == at::kBFloat16 && x.is_contiguous() && out.is_contiguous(),
+                "decode_mx4: up to 48 contiguous bf16 rows, K a multiple of 32");
     if (m == 0 || n == 0) return;
     const int slices = decode_slices(n, kg), gps = (kg + slices - 1) / slices;
     TORCH_CHECK(slices == 1 || part.numel() >= static_cast<int64_t>(slices) * m * n, "decode_mx4: scratch too small");
@@ -410,20 +410,26 @@ void decode_mx4(const at::Tensor& x, const at::Tensor& wt, const at::Tensor& sct
     float* o32 = out.scalar_type() == at::kFloat ? out.data_ptr<float>() : nullptr;
     auto* o16 = o32 == nullptr ? reinterpret_cast<unsigned short*>(out.data_ptr()) : nullptr;
     const auto* xp = reinterpret_cast<const unsigned short*>(x.data_ptr());
-    if (m <= 16)
-        decode_kernel<1><<<grid, 256, 0, stream>>>(xp, m, wt.data_ptr<uint8_t>(), sct.data_ptr<uint8_t>(),
-                                                   ref.data_ptr<int>(), n, ldn, k, gps, part.data_ptr<float>(), o16, o32, slices, counts.data_ptr<int>());
-    else
-        decode_kernel<2><<<grid, 256, 0, stream>>>(xp, m, wt.data_ptr<uint8_t>(), sct.data_ptr<uint8_t>(),
-                                                   ref.data_ptr<int>(), n, ldn, k, gps, part.data_ptr<float>(), o16, o32, slices, counts.data_ptr<int>());
+#define DECODE(MT)                                                                                                   \
+    decode_kernel<MT><<<grid, 256, 0, stream>>>(xp, m, wt.data_ptr<uint8_t>(), sct.data_ptr<uint8_t>(),              \
+                                                ref.data_ptr<int>(), n, ldn, k, gps, part.data_ptr<float>(), o16, o32,  \
+                                                slices, counts.data_ptr<int>())
+    if (m <= 16) {
+        DECODE(1);
+    } else if (m <= 32) {
+        DECODE(2);
+    } else {                                             // three streams' verify windows: the weights read once
+        DECODE(3);
+    }
+#undef DECODE
 }
 
-// x: (M, K) bf16 rows, M <= 32; w: (N, K) bf16 as stored; out and part as decode_mx4's.
+// x: (M, K) bf16 rows, M <= 48; w: (N, K) bf16 as stored; out and part as decode_mx4's.
 void decode_b16(const at::Tensor& x, const at::Tensor& w, at::Tensor& out, at::Tensor& part, at::Tensor& counts) {
     const int m = static_cast<int>(x.size(0)), k = static_cast<int>(x.size(1)), n = static_cast<int>(w.size(0));
-    TORCH_CHECK(m <= 32 && k % 32 == 0 && w.size(1) == k && x.scalar_type() == at::kBFloat16 &&
+    TORCH_CHECK(m <= 48 && k % 32 == 0 && w.size(1) == k && x.scalar_type() == at::kBFloat16 &&
                 w.scalar_type() == at::kBFloat16 && x.is_contiguous() && w.is_contiguous() && out.is_contiguous(),
-                "decode_b16: up to 32 contiguous bf16 rows against a contiguous bf16 (N, K) weight, K a multiple of 32");
+                "decode_b16: up to 48 contiguous bf16 rows against a contiguous bf16 (N, K) weight, K a multiple of 32");
     if (m == 0 || n == 0) return;
     const int kg = k / 32, slices = decode_slices(n, kg), gps = (kg + slices - 1) / slices;
     TORCH_CHECK(slices == 1 || part.numel() >= static_cast<int64_t>(slices) * m * n, "decode_b16: scratch too small");
@@ -435,7 +441,9 @@ void decode_b16(const at::Tensor& x, const at::Tensor& w, at::Tensor& out, at::T
     const auto* wp = reinterpret_cast<const unsigned short*>(w.data_ptr());
     if (m <= 16) {                                       // braces: torch's hipify mangles an else-line launch
         b16_kernel<1><<<grid, 256, 0, stream>>>(xp, m, wp, n, k, gps, part.data_ptr<float>(), o16, o32, slices, counts.data_ptr<int>());
-    } else {
+    } else if (m <= 32) {
         b16_kernel<2><<<grid, 256, 0, stream>>>(xp, m, wp, n, k, gps, part.data_ptr<float>(), o16, o32, slices, counts.data_ptr<int>());
+    } else {
+        b16_kernel<3><<<grid, 256, 0, stream>>>(xp, m, wp, n, k, gps, part.data_ptr<float>(), o16, o32, slices, counts.data_ptr<int>());
     }
 }
