@@ -6,8 +6,7 @@ import time
 
 import torch
 
-from tensorfold.cuda.build import hip
-from tensorfold.cuda.capacity import available_bytes, unified
+from tensorfold.cuda.capacity import available_bytes
 from tensorfold.cuda.markers import MIN_GAP
 from tensorfold.cuda.memory_gate import MemoryGate, NoRoom, torch_live
 from tensorfold.cuda.sampling import sample_streams
@@ -98,7 +97,7 @@ class MultiDecoder:
 
     def __init__(self, w: Weights, draft=None, *, max_rows: int = 16, allow_copy: bool = True, stop_eos: bool = True,
                  keep: int = 8, rank: int = 0, world: int = 1, context: int = 0, points=None, vision=None,
-                 tier=None) -> None:
+                 tier=None, trims: bool = True) -> None:
         if not 1 <= max_rows <= 16:
             raise ValueError("a stream's window is 1 to 16 rows (the multi-stream GDN tree kernel's limit)")
         self.w, self.draft, self.max_rows, self.allow_copy = w, draft, max_rows, allow_copy
@@ -132,10 +131,11 @@ class MultiDecoder:
         self.row_bytes = att * self.layer_bytes
         self.memory_gate = (MemoryGate(1 << 62, reserve=2 * GIB, live=torch_live(torch, available_bytes))
                      if world == 1 and cuda else None)
-        # The gate counts the allocator's freed bytes as free, so trimming them mid-round only matters where the
-        # GPU shares the host's memory. On ROCm, a trim between rounds unmapped and remapped pages inside live
-        # expandable segments, and values changed under finished kernels (NaN): there a dedicated GPU never trims.
-        self.trims = cuda and not (hip() and not unified(torch))
+        # Trims between rounds return whole free segments; on plain segments they also keep the gate's count of the
+        # allocator's freed bytes usable (without them, three 48K streams on an R9700 ran out of memory with 2.9 GiB
+        # reserved in pieces). The engine turns them off where they corrupt memory: expandable segments on ROCm
+        # (pytorch/pytorch#195202).
+        self.trims = cuda and trims
 
     def live(self) -> int:
         return len(self.streams) + len(self.filling)

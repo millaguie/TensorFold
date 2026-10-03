@@ -12,9 +12,10 @@ GitHub has the full notes and the measurements behind them.
   memory (`TF_MX4_EMBED=gpu` keeps it on the GPU), and startup refuses e8m0 scale codes 0 and 255. Token ids outside
   the embedding read its nearest row instead of host memory past it.
 - **`--ram-tier-gib`** keeps the prompt states the GPU cache lets go in pinned host RAM (jkuepker's #106).
-- **`--parallel` on ROCm** no longer trims the allocator between rounds on a dedicated GPU: with expandable
-  segments, those trims remapped live pages and corrupted values near full VRAM. The memory gate counts
-  `--kv-dtype fp8`'s packed rows. `TF_EXPANDABLE_SEGMENTS=0` turns expandable segments off.
+- **`--parallel` on ROCm** keeps PyTorch's plain segments: unmapping expandable segments under queued work corrupts
+  memory on gfx1201 ([pytorch/pytorch#195202](https://github.com/pytorch/pytorch/issues/195202)).
+  `TF_EXPANDABLE_SEGMENTS=1` turns them on, and then the allocator is not trimmed between rounds. The memory gate
+  counts `--kv-dtype fp8`'s packed rows.
 
 ## 0.6.2 (2 Oct 2026)
 
