@@ -11,6 +11,7 @@ The vision tower and the MTP head are not read (DFlash2 drafts; image input is n
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -121,6 +122,22 @@ def stack(parts: list[Mx4]) -> tuple[Mx4, list[Mx4]]:
     return whole, views
 
 
+def _quantized_head(weight: torch.Tensor):
+    """TF_MX4_HEAD=q4: the bf16 head as MLX affine 4-bit, groups of 64 (as the MLX checkpoints store theirs), in the
+    decode layout. Its logits differ slightly from the checkpoint's bf16 head (which vLLM-radiance serves), so it is
+    not the default."""
+
+    from .dflash2 import quantize4
+    from .qmm_fast import tile
+    from .weights import QLinear
+
+    parts = [quantize4(weight[a:a + 16384]) for a in range(0, weight.shape[0], 16384)]   # bounded fp32 scratch
+    q = QLinear(torch.cat([p.weight for p in parts]), torch.cat([p.scales for p in parts]),
+                torch.cat([p.biases for p in parts]))
+    del weight
+    return tile(q)
+
+
 def _offset_norm(t: torch.Tensor) -> torch.Tensor:
     return (t.float() + 1.0).to(torch.bfloat16)
 
@@ -183,9 +200,11 @@ def load_mx4(model_dir: str | Path, device: str = "cuda") -> Weights:
             at.proj, (at.q, at.k, at.v) = stack([at.q, at.k, at.v])
         layer.gu, (layer.gate, layer.up) = stack([layer.gate, layer.up])
     torch.cuda.empty_cache()
+    head = Plain(dense("lm_head.weight").to(torch.bfloat16))
+    if os.environ.get("TF_MX4_HEAD") == "q4":            # opt-in: the head as MLX 4-bit (reads a quarter of the bytes)
+        head = _quantized_head(head.weight)
     w = Weights(config=cfg, embed=Plain(dense(lm + "embed_tokens.weight").to(torch.bfloat16)), layers=layers,
-                norm=_offset_norm(dense(lm + "norm.weight")), head=Plain(dense("lm_head.weight").to(torch.bfloat16)),
-                quant="mx4")
+                norm=_offset_norm(dense(lm + "norm.weight")), head=head, quant="mx4")
     half = cfg.rope_dims // 2
     inv = cfg.rope_theta ** (-torch.arange(0, half, dtype=torch.float64) / half)
     w.inv_freq = inv.to(torch.float32).to(device)
