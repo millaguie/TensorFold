@@ -3,7 +3,8 @@
 import pytest
 import torch
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA only")
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available() or torch.version.hip is not None,
+                                reason="CUDA only (EXL3 packs are refused on ROCm)")
 
 PREFILL_ROWS = 2048     # the engine's prompt-chunk row count
 SLOTS = 9               # top_k + 1

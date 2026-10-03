@@ -11,6 +11,16 @@ from tests.test_cuda_geometry import allocations, bytes_in  # noqa: F401
 WEIGHTS = HEAD
 
 
+@pytest.fixture(autouse=True)
+def _nvidia(monkeypatch):
+    """The fake runtime stands in for an NVIDIA GPU: on a ROCm host, the engine must not take its ROCm paths."""
+
+    from tensorfold.cuda import build
+
+    monkeypatch.setattr(build, "hip", lambda: False)
+    monkeypatch.setattr(build, "gfx12", lambda: False)
+
+
 def start(family, path, requested, explicit, world, streams, rank=0):
     obj, _ = construct(family, path, requested, explicit, world, rank)
     kw = dict(tp=world, rank=rank, master="example", context_explicit=explicit, streams=streams)

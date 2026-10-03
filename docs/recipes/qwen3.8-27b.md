@@ -304,6 +304,21 @@ of context (tree attention 9.7 -> 7.3 ms), 40.1 and 39.6 ms at 16k. It needs ROC
 head size 256, one rank and the WMMA attention kernels: startup refuses it on NVIDIA (which serves bf16), with
 `--tp 2`, and with `TF_ROCM_ATTN_KERNEL=triton` or `TF_ROCM_TREE_KERNEL=triton`.
 
+Open items on ROCm (from the 2026-10-03 review of the fork):
+
+- Expandable segments come back on ROCm when [pytorch/pytorch#195202](https://github.com/pytorch/pytorch/issues/195202)
+  is fixed: drop the `hip()` default in `engine.py`. The stand-alone repro (`expandable_repro.py`, attached there)
+  stays out of the suite: it fills the whole GPU.
+- Decode matmuls stream at about 70% of the R9700's bandwidth at 16 rows (a 27B forward's matmuls 26.5 ms), and
+  one-client chat decode trails vLLM-radiance (48.5 against 54.5 tok/s). Tried and dropped: every group's weights
+  read into registers first (twice as slow), fetch-ahead in the MXFP4 prompt GEMM (7-10% slower). A verify round is
+  bound by the GPU, not the host's launches (17 ms to enqueue a forward, 39-45 ms to run it), so graph capture is
+  not the lever.
+- Not done, small: the tree attention tail kernel's fold (one wave, no double buffer), a 32-column FP8 prompt GEMM
+  variant for narrow outputs, `kv8.pack` a program per row instead of per (row, head).
+- ROCm's int64 `torch.topk` returned an index past the row for odd widths 21-53 (torch 2.12+rocm7.14);
+  `logprobs.capture` sorts such narrow rows instead. Not reported upstream yet.
+
 Limits: one rank; other families and EXL3 packs are refused. `--parallel 3` was run on an R9700 with three
 48K-token streams (with `--kv-dtype fp8`; each reply equal to its solo run).
 

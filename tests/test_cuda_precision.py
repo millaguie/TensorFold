@@ -9,6 +9,16 @@ from tensorfold.cuda import precision
 from tests.test_cuda_cli import _family
 
 
+@pytest.fixture(autouse=True)
+def _nvidia(monkeypatch):
+    """These checks stand in for an NVIDIA GPU: on a ROCm host, the ROCm paths must not answer for it."""
+
+    from tensorfold.cuda import build
+
+    monkeypatch.setattr(build, "hip", lambda: False)
+    monkeypatch.setattr(build, "gfx12", lambda: False)
+
+
 def test_the_flag_parses_and_defaults_to_the_checkpoints_math():
     parser = cli.build_parser()
     assert getattr(parser.parse_args(["serve", "owner/model"]), "precision", None) is None

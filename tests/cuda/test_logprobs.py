@@ -47,6 +47,10 @@ def test_zero_alternatives_and_rows_outside_the_reply_limit():
     assert len(record.rows) == 1 and record.rows[10]["top"] == []
 
 
+FLASH_NEXT = pytest.mark.skipif(torch.version.hip is not None, reason="Flash Next has no ROCm kernels")
+
+
+@FLASH_NEXT
 @pytest.mark.parametrize("sampled", [False, True])
 def test_flashnext_probabilities_match_drafted_and_serial_tokens(sampled):
     from test_flashnext_forward import _model
@@ -68,6 +72,7 @@ def test_flashnext_probabilities_match_drafted_and_serial_tokens(sampled):
     assert results[0] == results[1]
 
 
+@FLASH_NEXT
 def test_packed_prompts_and_shared_rounds_match_solo_probabilities():
     from test_flashnext_forward import _model
     from tensorfold.cuda.streams import Stream
@@ -92,6 +97,7 @@ def test_packed_prompts_and_shared_rounds_match_solo_probabilities():
     assert run(False) == run(True)
 
 
+@FLASH_NEXT
 def test_resumed_target_probabilities_match_a_fresh_prompt():
     from test_flashnext_forward import _model
     from tensorfold.engine.exact_sampling import Sampling

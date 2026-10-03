@@ -93,6 +93,8 @@ class MultiDecoder:
     block: int = 16                           # rows of the drafter's next block with several streams (pending, masks)
     depth: bool = True                        # whether the block follows the trees here (DEPTH_CHIPS)
     spent: dict | None = None                 # streams -> the last rounds' ms beside the forward
+    tier = None                               # a HostTier for prompt states the cache evicts (--ram-tier-gib)
+    trims: bool = True                        # empty_cache between rounds (off for expandable segments on ROCm)
     last: tuple | None = None                 # (start, streams, rows) of the round before
 
     def __init__(self, w: Weights, draft=None, *, max_rows: int = 16, allow_copy: bool = True, stop_eos: bool = True,

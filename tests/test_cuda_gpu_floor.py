@@ -8,6 +8,16 @@ torch = pytest.importorskip("torch")
 
 from tensorfold.cuda import build, capacity  # noqa: E402
 
+
+@pytest.fixture(autouse=True)
+def _nvidia(monkeypatch):
+    """These checks stand in for an NVIDIA GPU: on a ROCm host, the ROCm paths must not answer for it."""
+
+    from tensorfold.cuda import build
+
+    monkeypatch.setattr(build, "hip", lambda: False)
+    monkeypatch.setattr(build, "gfx12", lambda: False)
+
 GPUS = [((8, 6), "NVIDIA GeForce RTX 3090"), ((8, 9), "NVIDIA GeForce RTX 4090"), ((9, 0), "NVIDIA H100"),
         ((12, 1), "NVIDIA GB10")]
 

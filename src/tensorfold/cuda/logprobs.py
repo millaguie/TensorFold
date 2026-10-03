@@ -61,7 +61,9 @@ def capture(logits, tokens, positions, probabilities, rows=None):
         ordered = torch.where(bits < 0, ~bits, bits ^ 0x80000000) - 0x80000000
         token_ids = torch.arange(vocab, dtype=torch.int64, device=logits.device)
         keys = (ordered << 32) | (0xFFFFFFFF - token_ids)
-        top_ids = keys.topk(count, dim=-1, sorted=True).indices
+        # ROCm's int64 topk returned an index past the row for odd widths 21-53 (torch 2.12+rocm7.14): a sort there
+        top_ids = (keys.topk(count, dim=-1, sorted=True).indices if vocab >= 64
+                   else keys.sort(dim=-1, descending=True).indices[:, :count])
         scores = (logits.gather(1, top_ids).float() - lse[:, None]).cpu().tolist()
         alternatives = top_ids.cpu().tolist()
     else:

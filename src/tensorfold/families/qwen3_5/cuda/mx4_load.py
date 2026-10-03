@@ -17,7 +17,6 @@ from pathlib import Path
 
 import torch
 
-from .weights import GDN, Attention, Config, Layer, Plain, Weights
 
 # e2m1 codes 0-15 (bit 3 the sign): 0, 0.5, 1, 1.5, 2, 3, 4, 6 and their negatives
 E2M1 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0)
@@ -155,8 +154,10 @@ def _offset_norm(t: torch.Tensor) -> torch.Tensor:
     return (t.float() + 1.0).to(torch.bfloat16)
 
 
-def load_mx4(model_dir: str | Path, device: str = "cuda") -> Weights:
+def load_mx4(model_dir: str | Path, device: str = "cuda"):
     from safetensors import safe_open
+
+    from .weights import GDN, Attention, Config, Layer, Plain, Weights      # here: detection stays import-light
 
     model_dir = Path(model_dir)
     cfg = Config.read(model_dir)

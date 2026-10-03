@@ -8,7 +8,7 @@ import torch
 
 if not torch.cuda.is_available():
     pytest.skip("CUDA only", allow_module_level=True)
-if torch.cuda.get_device_capability()[0] != 12:
+if torch.cuda.get_device_capability()[0] != 12 or torch.version.hip is not None:   # gfx1201 reports 12.0 too
     pytest.skip("grouped launches run on sm_12x (GB10, RTX 50, RTX PRO 6000) only", allow_module_level=True)
 
 from tensorfold.cuda.kernels import qmm  # noqa: E402
