@@ -108,3 +108,5 @@ def test_host_table_rows_are_the_stored_rows():
     assert got.shape == (2, 3, 5120) and got.is_cuda
     assert torch.equal(got.cpu(), table[ids.cpu()])
     assert kmx.host_rows(torch.empty(0, dtype=torch.int64, device="cuda"), table).shape == (0, 5120)
+    edge = kmx.host_rows(torch.tensor([-3, 5000, 9999], device="cuda"), table).cpu()     # clamped, never past it
+    assert torch.equal(edge, table[[0, 4999, 4999]])

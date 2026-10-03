@@ -209,9 +209,16 @@ def load_mx4(model_dir: str | Path, device: str = "cuda") -> Weights:
     head = Plain(dense("lm_head.weight").to(torch.bfloat16))
     if os.environ.get("TF_MX4_HEAD") == "q4":            # opt-in: the head as MLX 4-bit (reads a quarter of the bytes)
         head = _quantized_head(head.weight)
+    embed = None
     if host_embed():                                     # a lookup table: its rows come over PCIe, VRAM goes to caches
-        embed = Plain(get(lm + "embed_tokens.weight").to(torch.bfloat16).contiguous().pin_memory())
-    else:
+        table = get(lm + "embed_tokens.weight").to(torch.bfloat16).contiguous()
+        try:
+            embed = Plain(table.pin_memory())
+        except RuntimeError as exc:                      # the host would not pin it: the GPU holds it, as before
+            print(f"[tensorfold] MXFP4: the embedding stays on the GPU ({table.nbytes / 2**30:.1f} GiB): host memory "
+                  f"would not pin it ({exc})", flush=True)
+        del table
+    if embed is None:
         embed = Plain(dense(lm + "embed_tokens.weight").to(torch.bfloat16))
     w = Weights(config=cfg, embed=embed, layers=layers,
                 norm=_offset_norm(dense(lm + "norm.weight")), head=head, quant="mx4")

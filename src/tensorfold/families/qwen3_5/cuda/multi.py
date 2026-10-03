@@ -164,8 +164,9 @@ class MultiDecoder:
         back = (self.tier.take(s.prompt, len(hit[0]) if hit else 0, rows=self._most(s))
                 if self.tier is not None and s.draft and encoded is None else None)
         if back is not None:        # a longer match in host RAM, in buffers of the stream's size: the stream resumes
-            ids, st, snap = back    # in them and the cache views their rows below pos, as a kept prompt end
-            self.cache.add(ids, viewed(clone_state(st)), own(snap))
+            ids, st, snap = back    # in them; the cache views their rows below pos and keeps its own DeltaNet states,
+            self.cache.add(ids, kept(st), own(snap))         # which this decoder's commits replay in place
+
             self.cache.longest(s.prompt)                     # resumed from, as a GPU hit is
             hit = (ids, st, snap)
         s.sid, s.cached = self.next_id, len(hit[0]) if hit else 0
