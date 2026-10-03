@@ -37,33 +37,57 @@ def quark_mxfp4(model_dir: str | Path) -> bool:
 
 @dataclass
 class Mx4:
-    """An MXFP4 projection: two e2m1 codes a byte (low nibble the even input), an e8m0 scale per 32 inputs."""
+    """An MXFP4 projection: two e2m1 codes a byte (low nibble the even input), an e8m0 scale per 32 inputs, kept in
+    the layout ``tensorfold.cuda.kernels.mx4`` reads: a group's 16 bytes for 16 columns side by side, the scales by
+    group, and each column's reference exponent (its largest scale)."""
 
-    weight: torch.Tensor      # (N, K / 2) uint8
-    scale: torch.Tensor       # (N, K / 32) uint8: the group's scale is 2^(e - 127)
+    tiles: torch.Tensor       # (N / 16, K / 32, 16, 16) uint8
+    scales_t: torch.Tensor    # (K / 32, N) uint8: the group's scale is 2^(e - 127)
+    ref: torch.Tensor         # (N,) int32
     layout: str = "mx4"
+
+    @classmethod
+    def from_checkpoint(cls, weight: torch.Tensor, scale: torch.Tensor) -> "Mx4":
+        from tensorfold.cuda.kernels.mx4 import to_tiles
+
+        return cls(to_tiles(weight), scale.t().contiguous(), scale.max(1).values.to(torch.int32).contiguous())
 
     @property
     def n(self) -> int:
-        return int(self.weight.shape[0])
+        return int(self.scales_t.shape[1])
 
     @property
     def k(self) -> int:
-        return int(self.weight.shape[1]) * 2
+        return int(self.scales_t.shape[0]) * GROUP
 
     def nbytes(self) -> int:
-        return self.weight.numel() + self.scale.numel()
+        return self.tiles.numel() + self.scales_t.numel() + self.ref.numel() * 4
+
+    def stored(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """The checkpoint's (N, K / 2) bytes and (N, K / 32) scales again."""
+
+        from tensorfold.cuda.kernels.mx4 import from_tiles
+
+        return from_tiles(self.tiles), self.scales_t.t()
 
     def rows(self, index: torch.Tensor) -> "Mx4":
-        return Mx4(self.weight.index_select(0, index).contiguous(), self.scale.index_select(0, index).contiguous())
+        weight, scale = self.stored()
+        return Mx4.from_checkpoint(weight.index_select(0, index), scale.index_select(0, index))
 
     def dequantize(self) -> torch.Tensor:
         """The (N, K) weight in bf16: every e2m1 value times a power of two is exact there."""
 
-        lut = torch.tensor(E2M1, dtype=torch.float32, device=self.weight.device)
-        codes = torch.stack([self.weight & 0x0F, self.weight >> 4], -1).reshape(self.n, self.k)
-        scale = torch.exp2(self.scale.float() - 127.0).repeat_interleave(GROUP, 1)
-        return (lut[codes.long()] * scale).to(torch.bfloat16)
+        weight, scale = self.stored()
+        lut = torch.tensor(E2M1, dtype=torch.float32, device=weight.device)
+        codes = torch.stack([weight & 0x0F, weight >> 4], -1).reshape(self.n, self.k)
+        return (lut[codes.long()] * torch.exp2(scale.float() - 127.0).repeat_interleave(GROUP, 1)).to(torch.bfloat16)
+
+    def prefill8(self, x: tuple) -> torch.Tensor:
+        """FP8 prompt fragments on RDNA4's folded-scale kernel (W4A8, as vLLM-radiance serves this checkpoint)."""
+
+        from tensorfold.cuda.kernels.mx4 import prompt
+
+        return prompt(x, self.tiles, self.scales_t, self.ref, self.n)
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         """Reference rows (not row-count invariant): the bf16 weight through torch's matmul."""
@@ -102,7 +126,7 @@ def load_mx4(model_dir: str | Path, device: str = "cuda") -> Weights:
         w, s = get(name + ".weight"), get(name + ".weight_scale")
         if w.dtype != torch.uint8 or s.dtype != torch.uint8 or s.shape[1] * GROUP != w.shape[1] * 2:
             raise ValueError(f"{name}: expected (N, K / 2) fp4 bytes with (N, K / 32) e8m0 scales")
-        return Mx4(w.contiguous().to(device), s.contiguous().to(device))
+        return Mx4.from_checkpoint(w.to(device), s.to(device))
 
     def dense(name: str) -> torch.Tensor:
         return get(name).contiguous().to(device)
