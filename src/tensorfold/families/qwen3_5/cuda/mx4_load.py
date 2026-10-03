@@ -105,6 +105,22 @@ class Mx4:
         return self(x)
 
 
+def stack(parts: list[Mx4]) -> tuple[Mx4, list[Mx4]]:
+    """Projections of one input as one (rows concatenated) and the members again as views into it: no memory added.
+    Their outputs are the stacked call's columns, each computed alone, so a member's bits are the same either way."""
+
+    if any(p.k != parts[0].k or p.n % 16 for p in parts):
+        raise ValueError("stacked MXFP4 projections share K and take whole 16-row tiles")
+    whole = Mx4(torch.cat([p.tiles for p in parts]), torch.cat([p.scales_t for p in parts], 1).contiguous(),
+                torch.cat([p.ref for p in parts]))
+    views, a = [], 0
+    for p in parts:
+        b = a + p.n
+        views.append(Mx4(whole.tiles[a // 16:b // 16], whole.scales_t[:, a:b], whole.ref[a:b]))
+        a = b
+    return whole, views
+
+
 def _offset_norm(t: torch.Tensor) -> torch.Tensor:
     return (t.float() + 1.0).to(torch.bfloat16)
 
@@ -158,6 +174,15 @@ def load_mx4(model_dir: str | Path, device: str = "cuda") -> Weights:
         layers.append(Layer(linear=cfg.is_linear(i), input_norm=_offset_norm(dense(p + "input_layernorm.weight")),
                             post_norm=_offset_norm(dense(p + "post_attention_layernorm.weight")), gdn=gdn, attn=attn,
                             gate=mx(p + "mlp.gate_proj"), up=mx(p + "mlp.up_proj"), down=mx(p + "mlp.down_proj")))
+    for layer in layers:                                       # one matmul for each layer's input projections
+        if layer.gdn is not None:
+            g = layer.gdn
+            g.proj, (g.qkv, g.z, g.b, g.a) = stack([g.qkv, g.z, g.b, g.a])
+        else:
+            at = layer.attn
+            at.proj, (at.q, at.k, at.v) = stack([at.q, at.k, at.v])
+        layer.gu, (layer.gate, layer.up) = stack([layer.gate, layer.up])
+    torch.cuda.empty_cache()
     w = Weights(config=cfg, embed=Plain(dense(lm + "embed_tokens.weight").to(torch.bfloat16)), layers=layers,
                 norm=_offset_norm(dense(lm + "norm.weight")), head=Plain(dense("lm_head.weight").to(torch.bfloat16)),
                 quant="mx4")

@@ -13,7 +13,7 @@ def _ext():
     from tensorfold.cuda.build import load
 
     here = Path(__file__).parent
-    return load(name="tensorfold_mx4_rocm_v6", sources=[str(here / "mx4_rocm.cpp"), str(here / "mx4_rocm.cu")],
+    return load(name="tensorfold_mx4_rocm_v9", sources=[str(here / "mx4_rocm.cpp"), str(here / "mx4_rocm.cu")],
                 extra_cuda_cflags=["-O3", "--fmad=false"], verbose=False)
 
 
