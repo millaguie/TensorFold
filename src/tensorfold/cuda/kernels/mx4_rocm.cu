@@ -68,8 +68,8 @@ __device__ __forceinline__ uint4 widen16(unsigned u0, unsigned u1, unsigned lo, 
 template <int TN>
 __global__ void __launch_bounds__(256) prompt_kernel(
         const uint8_t* __restrict__ x8t, const float* __restrict__ a, const uint8_t* __restrict__ wt,
-        const uint8_t* __restrict__ sct, const int* __restrict__ ref, int m, int n, int k, void* __restrict__ out,
-        bool f32) {
+        const uint8_t* __restrict__ sct, const int* __restrict__ ref, int m, int n, int ldn, int k,
+        void* __restrict__ out, bool f32) {
     constexpr int WN = 2, TM = 4, BM = 256, BN = WN * TN * 16, SK = 64, NS = SK / 16, PITCH = SK + 8;
     constexpr int PIECES = BN * 2;                       // a column's two 32-input groups a slab, 16 bytes each
     static_assert(PIECES <= 256, "one piece a thread");
@@ -104,7 +104,7 @@ __global__ void __launch_bounds__(256) prompt_kernel(
         if (tid < PIECES) {                              // the weights first: staging waits on them alone
             const int g = 2 * sl + pg;
             wv = *reinterpret_cast<const uint4*>(wt + ((static_cast<size_t>(pcol >> 4) * kg + g) * 16 + (pcol & 15)) * 16);
-            d = min(max(pref - static_cast<int>(sct[static_cast<size_t>(g) * n + pcol]), 0), 15);
+            d = min(max(pref - static_cast<int>(sct[static_cast<size_t>(g) * ldn + pcol]), 0), 15);
         }
         int2v af[TM][NS];
 #pragma unroll
@@ -206,8 +206,8 @@ constexpr int DGS = 16;                                  // groups (512 inputs) 
 template <int MT>
 __global__ void __launch_bounds__(256) decode_kernel(
         const unsigned short* __restrict__ x, int m, const uint8_t* __restrict__ wt, const uint8_t* __restrict__ sct,
-        const int* __restrict__ ref, int n, int k, int gps, float* __restrict__ part, unsigned short* __restrict__ out16,
-        float* __restrict__ out32, int slices) {
+        const int* __restrict__ ref, int n, int ldn, int k, int gps, float* __restrict__ part,
+        unsigned short* __restrict__ out16, float* __restrict__ out32, int slices) {
     __shared__ __align__(16) unsigned short xl[MT * 16][DGS * 32 + 8];
     const int kg = k / 32, slice = blockIdx.y, g0 = slice * gps, g1 = min(kg, g0 + gps);
     const int lane = threadIdx.x & 31, wave = threadIdx.x >> 5, h = lane >> 4, c = lane & 15;
@@ -231,7 +231,7 @@ __global__ void __launch_bounds__(256) decode_kernel(
         for (int j = 0; j < groups; ++j) {
             const int g = gb + j;
             const uint4 gw = *reinterpret_cast<const uint4*>(wt + ((static_cast<size_t>(colc >> 4) * kg + g) * 16 + (colc & 15)) * 16);
-            const unsigned d = static_cast<unsigned>(r - static_cast<int>(sct[static_cast<size_t>(g) * n + colc]));
+            const unsigned d = static_cast<unsigned>(r - static_cast<int>(sct[static_cast<size_t>(g) * ldn + colc]));
             const unsigned shift = (d << 7) | (d << 23);
 #pragma unroll
             for (int s = 0; s < 2; ++s) {
@@ -332,17 +332,19 @@ void prompt_mx4(const at::Tensor& x8, const at::Tensor& a, const at::Tensor& wt,
     TORCH_CHECK(x8.dim() == 3 && x8.size(2) == 256 && x8.size(0) == (m + 15) / 16 && k % 64 == 0,
                 "prompt_mx4: (M / 16, K / 16, 256) fragments, K a multiple of 64");
     TORCH_CHECK(wt.numel() == static_cast<int64_t>((n + 15) / 16) * 16 * (k / 2) && sct.size(0) == k / 32 &&
-                sct.size(1) == n && ref.numel() == n && ref.scalar_type() == at::kInt && a.scalar_type() == at::kFloat,
-                "prompt_mx4: tiled fp4 words, (K / 32, N) scales, (N,) int32 references, fp32 row scales");
-    TORCH_CHECK(x8.is_contiguous() && wt.is_contiguous() && sct.is_contiguous() && out.is_contiguous(),
-                "prompt_mx4 takes contiguous tensors");
+                sct.size(1) == n && sct.stride(1) == 1 && ref.numel() == n && ref.is_contiguous() &&
+                ref.scalar_type() == at::kInt && a.scalar_type() == at::kFloat,
+                "prompt_mx4: tiled fp4 words, (K / 32, N) scales (rows may stride), (N,) int32 references, fp32 row "
+                "scales");
+    TORCH_CHECK(x8.is_contiguous() && wt.is_contiguous() && out.is_contiguous(), "prompt_mx4 takes contiguous tensors");
+    const int ldn = static_cast<int>(sct.stride(0));
     if (m == 0 || n == 0) return;
     auto stream = at::cuda::getCurrentCUDAStream();
     const dim3 grid((n + 32 * tn - 1) / (32 * tn), (m + 255) / 256);
     const bool f32 = out.scalar_type() == at::kFloat;
 #define LAUNCH(TN)                                                                                                \
     prompt_kernel<TN><<<grid, 256, 0, stream>>>(x8.data_ptr<uint8_t>(), a.data_ptr<float>(), wt.data_ptr<uint8_t>(), \
-                                                sct.data_ptr<uint8_t>(), ref.data_ptr<int>(), m, n, k, out.data_ptr(), f32)
+                                                sct.data_ptr<uint8_t>(), ref.data_ptr<int>(), m, n, ldn, k, out.data_ptr(), f32)
     if (tn == 2) LAUNCH(2);
     else LAUNCH(4);
 #undef LAUNCH
@@ -364,6 +366,9 @@ void decode_mx4(const at::Tensor& x, const at::Tensor& wt, const at::Tensor& sct
     if (m == 0 || n == 0) return;
     const int slices = decode_slices(n, kg), gps = (kg + slices - 1) / slices;
     TORCH_CHECK(slices == 1 || part.numel() >= static_cast<int64_t>(slices) * m * n, "decode_mx4: scratch too small");
+    TORCH_CHECK(wt.is_contiguous() && sct.size(1) == n && sct.stride(1) == 1 && ref.is_contiguous() && ref.numel() == n,
+                "decode_mx4: contiguous tiles and references, (K / 32, N) scales whose rows may stride");
+    const int ldn = static_cast<int>(sct.stride(0));
     auto stream = at::cuda::getCurrentCUDAStream();
     const dim3 grid((n + 127) / 128, slices);
     float* o32 = out.scalar_type() == at::kFloat ? out.data_ptr<float>() : nullptr;
@@ -371,10 +376,10 @@ void decode_mx4(const at::Tensor& x, const at::Tensor& wt, const at::Tensor& sct
     const auto* xp = reinterpret_cast<const unsigned short*>(x.data_ptr());
     if (m <= 16)
         decode_kernel<1><<<grid, 256, 0, stream>>>(xp, m, wt.data_ptr<uint8_t>(), sct.data_ptr<uint8_t>(),
-                                                   ref.data_ptr<int>(), n, k, gps, part.data_ptr<float>(), o16, o32, slices);
+                                                   ref.data_ptr<int>(), n, ldn, k, gps, part.data_ptr<float>(), o16, o32, slices);
     else
         decode_kernel<2><<<grid, 256, 0, stream>>>(xp, m, wt.data_ptr<uint8_t>(), sct.data_ptr<uint8_t>(),
-                                                   ref.data_ptr<int>(), n, k, gps, part.data_ptr<float>(), o16, o32, slices);
+                                                   ref.data_ptr<int>(), n, ldn, k, gps, part.data_ptr<float>(), o16, o32, slices);
     if (slices > 1) {
         const size_t total = static_cast<size_t>(m) * n;
         reduce_kernel<<<(total + 255) / 256, 256, 0, stream>>>(part.data_ptr<float>(), slices, total, o32, o16);
