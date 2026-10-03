@@ -121,7 +121,13 @@ class MultiDecoder:
         self.block = max_rows
         # one GPU: a stream's caches hold its prompt, then grow a step at a time while the gate has room
         c, att = w.config, sum(1 for layer in getattr(w, "layers", ()) if not layer.linear)
-        self.layer_bytes = 2 * getattr(c, "kv_heads", 0) * getattr(c, "head_dim", 0) * 2     # a row of one layer
+        if getattr(w, "kv_fp8", False):                       # --kv-dtype fp8: packed e4m3 rows with their scale
+            from tensorfold.cuda.kernels.kv8 import ROW8
+
+            row = ROW8
+        else:
+            row = getattr(c, "head_dim", 0) * 2
+        self.layer_bytes = 2 * getattr(c, "kv_heads", 0) * row                              # a row of one layer
         self.row_bytes = att * self.layer_bytes
         self.memory_gate = (MemoryGate(1 << 62, reserve=2 * GIB, live=torch_live(torch, available_bytes))
                      if world == 1 and cuda else None)

@@ -261,12 +261,12 @@ __device__ __forceinline__ void finish(const float8 (&acc)[MT], float cs, bool l
     if (threadIdx.x == 0) counts[blockIdx.x] = 0;
 }
 
-template <int MT>
+template <int MT, int G>
 __global__ void __launch_bounds__(256) decode_kernel(
         const unsigned short* __restrict__ x, int m, const uint8_t* __restrict__ wt, const uint8_t* __restrict__ sct,
         const int* __restrict__ ref, int n, int ldn, int k, int gps, float* __restrict__ part,
         unsigned short* __restrict__ out16, float* __restrict__ out32, int slices, int* __restrict__ counts) {
-    __shared__ __align__(16) unsigned short xl[MT * 16][DGS * 32 + 8];
+    __shared__ __align__(16) unsigned short xl[MT * 16][G * 32 + 8];
     const int kg = k / 32, slice = blockIdx.y, g0 = slice * gps, g1 = min(kg, g0 + gps);
     const int lane = threadIdx.x & 31, wave = threadIdx.x >> 5, h = lane >> 4, c = lane & 15;
     const int col = blockIdx.x * 128 + wave * 16 + c, colc = min(col, n - 1);
@@ -274,11 +274,11 @@ __global__ void __launch_bounds__(256) decode_kernel(
     float8 acc[MT];
 #pragma unroll
     for (int t = 0; t < MT; ++t) acc[t] = float8{0, 0, 0, 0, 0, 0, 0, 0};
-    for (int gb = g0; gb < g1; gb += DGS) {
-        const int groups = min(DGS, g1 - gb);
+    for (int gb = g0; gb < g1; gb += G) {
+        const int groups = min(G, g1 - gb);
         __syncthreads();
-        for (int i = threadIdx.x; i < MT * 16 * DGS * 4; i += 256) {   // 16-byte pieces of the rows' inputs
-            const int row = i / (DGS * 4), pc = i % (DGS * 4);
+        for (int i = threadIdx.x; i < MT * 16 * G * 4; i += 256) {   // 16-byte pieces of the rows' inputs
+            const int row = i / (G * 4), pc = i % (G * 4);
             uint4 v = make_uint4(0, 0, 0, 0);
             if (row < m && pc < groups * 4)
                 v = *reinterpret_cast<const uint4*>(x + static_cast<size_t>(row) * k + gb * 32 + pc * 8);
@@ -307,12 +307,12 @@ __global__ void __launch_bounds__(256) decode_kernel(
 
 // ``b16_kernel``: the same rows times a bf16 (N, K) weight as stored (the MXFP4 checkpoint's head; the drafter's rows
 // of it): no widening, the same slices and order, so a row's bits are the same in any call.
-template <int MT>
+template <int MT, int G>
 __global__ void __launch_bounds__(256) b16_kernel(
         const unsigned short* __restrict__ x, int m, const unsigned short* __restrict__ wb, int n, int k, int gps,
         float* __restrict__ part, unsigned short* __restrict__ out16, float* __restrict__ out32, int slices,
         int* __restrict__ counts) {
-    __shared__ __align__(16) unsigned short xl[MT * 16][DGS * 32 + 8];
+    __shared__ __align__(16) unsigned short xl[MT * 16][G * 32 + 8];
     const int kg = k / 32, slice = blockIdx.y, g0 = slice * gps, g1 = min(kg, g0 + gps);
     const int lane = threadIdx.x & 31, wave = threadIdx.x >> 5, h = lane >> 4, c = lane & 15;
     const int col = blockIdx.x * 128 + wave * 16 + c, colc = min(col, n - 1);
@@ -320,11 +320,11 @@ __global__ void __launch_bounds__(256) b16_kernel(
     float8 acc[MT];
 #pragma unroll
     for (int t = 0; t < MT; ++t) acc[t] = float8{0, 0, 0, 0, 0, 0, 0, 0};
-    for (int gb = g0; gb < g1; gb += DGS) {
-        const int groups = min(DGS, g1 - gb);
+    for (int gb = g0; gb < g1; gb += G) {
+        const int groups = min(G, g1 - gb);
         __syncthreads();
-        for (int i = threadIdx.x; i < MT * 16 * DGS * 4; i += 256) {
-            const int row = i / (DGS * 4), pc = i % (DGS * 4);
+        for (int i = threadIdx.x; i < MT * 16 * G * 4; i += 256) {
+            const int row = i / (G * 4), pc = i % (G * 4);
             uint4 v = make_uint4(0, 0, 0, 0);
             if (row < m && pc < groups * 4)
                 v = *reinterpret_cast<const uint4*>(x + static_cast<size_t>(row) * k + gb * 32 + pc * 8);
@@ -346,6 +346,15 @@ __global__ void __launch_bounds__(256) b16_kernel(
         }
     }
     finish<MT>(acc, 1.0f, col < n, col, m, n, slice, slices, part, out16, out32, counts);
+}
+
+// Token rows of a bf16 table kept in pinned host memory (the MXFP4 checkpoint's embedding): each block copies one
+// row over PCIe through the mapped host pointer, 16 bytes a thread. Bits as stored; no host synchronisation.
+__global__ void host_rows_kernel(const uint4* __restrict__ table, const int64_t* __restrict__ ids, int64_t pieces,
+                                 uint4* __restrict__ out) {
+    const int64_t row = ids[blockIdx.x];
+    for (int64_t i = threadIdx.x; i < pieces; i += blockDim.x)
+        out[static_cast<int64_t>(blockIdx.x) * pieces + i] = table[row * pieces + i];
 }
 
 __global__ void reduce_kernel(const float* __restrict__ part, int slices, size_t total, float* __restrict__ out32,
@@ -410,16 +419,18 @@ void decode_mx4(const at::Tensor& x, const at::Tensor& wt, const at::Tensor& sct
     float* o32 = out.scalar_type() == at::kFloat ? out.data_ptr<float>() : nullptr;
     auto* o16 = o32 == nullptr ? reinterpret_cast<unsigned short*>(out.data_ptr()) : nullptr;
     const auto* xp = reinterpret_cast<const unsigned short*>(x.data_ptr());
-#define DECODE(MT)                                                                                                   \
-    decode_kernel<MT><<<grid, 256, 0, stream>>>(xp, m, wt.data_ptr<uint8_t>(), sct.data_ptr<uint8_t>(),              \
+#define DECODE(MT, G)                                                                                                \
+    decode_kernel<MT, G><<<grid, 256, 0, stream>>>(xp, m, wt.data_ptr<uint8_t>(), sct.data_ptr<uint8_t>(),              \
                                                 ref.data_ptr<int>(), n, ldn, k, gps, part.data_ptr<float>(), o16, o32,  \
                                                 slices, counts.data_ptr<int>())
+    // more row tiles stage fewer groups a step: 16 KB / 17 KB / 25 KB of LDS, two blocks a CU past 16 rows (the
+    // 48-row matmuls of a 27B forward 56 -> 44 ms on an R9700); the sums keep their order, so the same bits
     if (m <= 16) {
-        DECODE(1);
+        DECODE(1, 16);
     } else if (m <= 32) {
-        DECODE(2);
+        DECODE(2, 8);
     } else {                                             // three streams' verify windows: the weights read once
-        DECODE(3);
+        DECODE(3, 8);
     }
 #undef DECODE
 }
@@ -440,10 +451,24 @@ void decode_b16(const at::Tensor& x, const at::Tensor& w, at::Tensor& out, at::T
     const auto* xp = reinterpret_cast<const unsigned short*>(x.data_ptr());
     const auto* wp = reinterpret_cast<const unsigned short*>(w.data_ptr());
     if (m <= 16) {                                       // braces: torch's hipify mangles an else-line launch
-        b16_kernel<1><<<grid, 256, 0, stream>>>(xp, m, wp, n, k, gps, part.data_ptr<float>(), o16, o32, slices, counts.data_ptr<int>());
+        b16_kernel<1, 16><<<grid, 256, 0, stream>>>(xp, m, wp, n, k, gps, part.data_ptr<float>(), o16, o32, slices, counts.data_ptr<int>());
     } else if (m <= 32) {
-        b16_kernel<2><<<grid, 256, 0, stream>>>(xp, m, wp, n, k, gps, part.data_ptr<float>(), o16, o32, slices, counts.data_ptr<int>());
+        b16_kernel<2, 8><<<grid, 256, 0, stream>>>(xp, m, wp, n, k, gps, part.data_ptr<float>(), o16, o32, slices, counts.data_ptr<int>());
     } else {
-        b16_kernel<3><<<grid, 256, 0, stream>>>(xp, m, wp, n, k, gps, part.data_ptr<float>(), o16, o32, slices, counts.data_ptr<int>());
+        b16_kernel<3, 8><<<grid, 256, 0, stream>>>(xp, m, wp, n, k, gps, part.data_ptr<float>(), o16, o32, slices, counts.data_ptr<int>());
     }
+}
+
+// table: (V, D) bf16 in pinned host memory (device-mapped); ids: (M,) int64 on the GPU; out: (M, D) bf16.
+void host_rows(const at::Tensor& table, const at::Tensor& ids, at::Tensor& out) {
+    TORCH_CHECK(!table.is_cuda() && table.is_pinned() && table.is_contiguous() && table.scalar_type() == at::kBFloat16 &&
+                (table.size(1) * 2) % 16 == 0, "host_rows: a contiguous pinned bf16 table, rows of 16-byte multiples");
+    TORCH_CHECK(ids.is_cuda() && ids.scalar_type() == at::kLong && ids.is_contiguous() && out.is_contiguous() &&
+                out.size(0) == ids.numel() && out.size(1) == table.size(1), "host_rows: int64 ids and (M, D) out");
+    if (ids.numel() == 0) return;
+    void* mapped = nullptr;
+    TORCH_CHECK(hipHostGetDevicePointer(&mapped, table.data_ptr(), 0) == hipSuccess, "host_rows: table not mapped");
+    const int64_t pieces = table.size(1) * 2 / 16;
+    host_rows_kernel<<<static_cast<unsigned>(ids.numel()), 256, 0, at::cuda::getCurrentCUDAStream()>>>(
+        reinterpret_cast<const uint4*>(mapped), ids.data_ptr<int64_t>(), pieces, reinterpret_cast<uint4*>(out.data_ptr()));
 }

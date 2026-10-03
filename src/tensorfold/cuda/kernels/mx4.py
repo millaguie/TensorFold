@@ -13,7 +13,7 @@ def _ext():
     from tensorfold.cuda.build import load
 
     here = Path(__file__).parent
-    return load(name="tensorfold_mx4_rocm_v11", sources=[str(here / "mx4_rocm.cpp"), str(here / "mx4_rocm.cu")],
+    return load(name="tensorfold_mx4_rocm_v13", sources=[str(here / "mx4_rocm.cpp"), str(here / "mx4_rocm.cu")],
                 extra_cuda_cflags=["-O3", "--fmad=false"], verbose=False)
 
 
@@ -95,3 +95,12 @@ def b16(x: torch.Tensor, weight: torch.Tensor, *, f32: bool = False) -> torch.Te
     for a in range(0, m, 48):
         ext.decode_b16(x[a:a + 48], weight, out[a:a + 48], part, _count(x.device, n))
     return out
+
+
+def host_rows(ids: torch.Tensor, table: torch.Tensor) -> torch.Tensor:
+    """Rows ``ids`` of a bf16 table in pinned host memory, gathered on the GPU over PCIe."""
+
+    flat = ids.reshape(-1).to(torch.int64).contiguous()
+    out = torch.empty((flat.numel(), table.shape[1]), dtype=torch.bfloat16, device=ids.device)
+    _ext().host_rows(table, flat, out)
+    return out.view(*ids.shape, table.shape[1])

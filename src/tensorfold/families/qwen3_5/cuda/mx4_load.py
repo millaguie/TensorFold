@@ -138,6 +138,12 @@ def _quantized_head(weight: torch.Tensor):
     return tile(q)
 
 
+def host_embed() -> bool:
+    """The bf16 embedding (2.4 GB on the 27B) in pinned host memory, unless ``TF_MX4_EMBED=gpu``."""
+
+    return os.environ.get("TF_MX4_EMBED", "host") != "gpu"
+
+
 def _offset_norm(t: torch.Tensor) -> torch.Tensor:
     return (t.float() + 1.0).to(torch.bfloat16)
 
@@ -203,7 +209,11 @@ def load_mx4(model_dir: str | Path, device: str = "cuda") -> Weights:
     head = Plain(dense("lm_head.weight").to(torch.bfloat16))
     if os.environ.get("TF_MX4_HEAD") == "q4":            # opt-in: the head as MLX 4-bit (reads a quarter of the bytes)
         head = _quantized_head(head.weight)
-    w = Weights(config=cfg, embed=Plain(dense(lm + "embed_tokens.weight").to(torch.bfloat16)), layers=layers,
+    if host_embed():                                     # a lookup table: its rows come over PCIe, VRAM goes to caches
+        embed = Plain(get(lm + "embed_tokens.weight").to(torch.bfloat16).contiguous().pin_memory())
+    else:
+        embed = Plain(dense(lm + "embed_tokens.weight").to(torch.bfloat16))
+    w = Weights(config=cfg, embed=embed, layers=layers,
                 norm=_offset_norm(dense(lm + "norm.weight")), head=head, quant="mx4")
     half = cfg.rope_dims // 2
     inv = cfg.rope_theta ** (-torch.arange(0, half, dtype=torch.float64) / half)
@@ -218,7 +228,7 @@ def weight_bytes(name: str, info: dict) -> tuple[int, int]:
     """The startup estimate's transform: projections as stored (bytes, scales, a reference exponent a column), the
     embedding and head in bf16 and the drafter's copy of the head's rows; the vision tower and MTP head unread."""
 
-    if name.startswith(("model.visual.", "mtp.")):
+    if name.startswith(("model.visual.", "mtp.")) or (name.endswith("embed_tokens.weight") and host_embed()):
         return 0, 0
     size = int(info["data_offsets"][1]) - int(info["data_offsets"][0])
     if name.endswith(".weight_scale"):
@@ -226,4 +236,4 @@ def weight_bytes(name: str, info: dict) -> tuple[int, int]:
     return (size * 7 // 5 if name == "lm_head.weight" else size), 0
 
 
-__all__ = ["E2M1", "GROUP", "Mx4", "load_mx4", "quark_mxfp4", "weight_bytes"]
+__all__ = ["E2M1", "GROUP", "Mx4", "host_embed", "load_mx4", "quark_mxfp4", "weight_bytes"]
