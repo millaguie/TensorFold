@@ -90,7 +90,14 @@ class Mx4:
         return prompt(x, self.tiles, self.scales_t, self.ref, self.n)
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
-        """Reference rows (not row-count invariant): the bf16 weight through torch's matmul."""
+        """Decode and verify rows on RDNA4's MXFP4 kernel: the same row bits at any row count."""
+
+        from tensorfold.cuda.kernels.mx4 import decode
+
+        return decode(x, self.tiles, self.scales_t, self.ref, self.n)
+
+    def reference(self, x: torch.Tensor) -> torch.Tensor:
+        """The bf16 weight through torch's matmul (not row-count invariant)."""
 
         return (x.to(torch.bfloat16) @ self.dequantize().t()).to(torch.bfloat16)
 
