@@ -170,4 +170,16 @@ def load_mx4(model_dir: str | Path, device: str = "cuda") -> Weights:
     return w
 
 
-__all__ = ["E2M1", "GROUP", "Mx4", "load_mx4", "quark_mxfp4"]
+def weight_bytes(name: str, info: dict) -> tuple[int, int]:
+    """The startup estimate's transform: projections as stored (bytes, scales, a reference exponent a column), the
+    embedding and head in bf16 and the drafter's copy of the head's rows; the vision tower and MTP head unread."""
+
+    if name.startswith(("model.visual.", "mtp.")):
+        return 0, 0
+    size = int(info["data_offsets"][1]) - int(info["data_offsets"][0])
+    if name.endswith(".weight_scale"):
+        return size + size // (info["shape"][1]) * 4, 0
+    return (size * 7 // 5 if name == "lm_head.weight" else size), 0
+
+
+__all__ = ["E2M1", "GROUP", "Mx4", "load_mx4", "quark_mxfp4", "weight_bytes"]

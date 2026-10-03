@@ -202,6 +202,7 @@ __device__ __forceinline__ short8 wfrag(const uint4& g, int s, int h, unsigned s
 }
 
 constexpr int DGS = 16;                                  // groups (512 inputs) staged a step
+constexpr int AHEAD = 8;                                 // groups whose weights load together
 
 template <int MT>
 __global__ void __launch_bounds__(256) decode_kernel(
@@ -228,18 +229,31 @@ __global__ void __launch_bounds__(256) decode_kernel(
             *reinterpret_cast<uint2*>(&xl[row][pc * 8 + 4]) = make_uint2(v.z, v.w);
         }
         __syncthreads();
-        for (int j = 0; j < groups; ++j) {
-            const int g = gb + j;
-            const uint4 gw = *reinterpret_cast<const uint4*>(wt + ((static_cast<size_t>(colc >> 4) * kg + g) * 16 + (colc & 15)) * 16);
-            const unsigned d = static_cast<unsigned>(r - static_cast<int>(sct[static_cast<size_t>(g) * n + colc]));
-            const unsigned shift = (d << 7) | (d << 23);
+        // AHEAD groups' words and scales loaded at once, then their WMMAs: more reads in flight (memory bound)
+        const uint8_t* wcol = wt + (static_cast<size_t>(colc >> 4) * kg * 16 + (colc & 15)) * 16;
+        for (int j0 = 0; j0 < groups; j0 += AHEAD) {
+            uint4 gw[AHEAD];
+            int sc[AHEAD];
 #pragma unroll
-            for (int s = 0; s < 2; ++s) {
-                const short8 b = wfrag(gw, s, h, shift);
+            for (int u = 0; u < AHEAD; ++u) {
+                const int g = gb + min(j0 + u, groups - 1);   // past the step: its last group again (unused)
+                gw[u] = *reinterpret_cast<const uint4*>(wcol + static_cast<size_t>(g) * 256);
+                sc[u] = sct[static_cast<size_t>(g) * n + colc];
+            }
 #pragma unroll
-                for (int t = 0; t < MT; ++t) {
-                    const short8 av = *reinterpret_cast<const short8*>(&xl[16 * t + c][j * 32 + 16 * s + 8 * h]);
-                    acc[t] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(av, b, acc[t]);
+            for (int u = 0; u < AHEAD; ++u) {
+                if (j0 + u >= groups) break;
+                const int j = j0 + u;
+                const unsigned d = static_cast<unsigned>(r - sc[u]);
+                const unsigned shift = (d << 7) | (d << 23);
+#pragma unroll
+                for (int s = 0; s < 2; ++s) {
+                    const short8 b = wfrag(gw[u], s, h, shift);
+#pragma unroll
+                    for (int t = 0; t < MT; ++t) {
+                        const short8 av = *reinterpret_cast<const short8*>(&xl[16 * t + c][j * 32 + 16 * s + 8 * h]);
+                        acc[t] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(av, b, acc[t]);
+                    }
                 }
             }
         }
@@ -253,6 +267,59 @@ __global__ void __launch_bounds__(256) decode_kernel(
             const int row = 16 * t + 8 * h + i;
             if (row >= m) break;
             const float v = acc[t][i] * cs;
+            if (slices > 1) part[(static_cast<size_t>(slice) * m + row) * n + col] = v;
+            else if (out32 != nullptr) out32[static_cast<size_t>(row) * n + col] = v;
+            else out16[static_cast<size_t>(row) * n + col] = bf16_round(v);
+        }
+}
+
+// ``b16_kernel``: the same rows times a bf16 (N, K) weight as stored (the MXFP4 checkpoint's head; the drafter's rows
+// of it): no widening, the same slices and order, so a row's bits are the same in any call.
+template <int MT>
+__global__ void __launch_bounds__(256) b16_kernel(
+        const unsigned short* __restrict__ x, int m, const unsigned short* __restrict__ wb, int n, int k, int gps,
+        float* __restrict__ part, unsigned short* __restrict__ out16, float* __restrict__ out32, int slices) {
+    __shared__ __align__(16) unsigned short xl[MT * 16][DGS * 32 + 8];
+    const int kg = k / 32, slice = blockIdx.y, g0 = slice * gps, g1 = min(kg, g0 + gps);
+    const int lane = threadIdx.x & 31, wave = threadIdx.x >> 5, h = lane >> 4, c = lane & 15;
+    const int col = blockIdx.x * 128 + wave * 16 + c, colc = min(col, n - 1);
+    const unsigned short* wrow = wb + static_cast<size_t>(colc) * k;
+    float8 acc[MT];
+#pragma unroll
+    for (int t = 0; t < MT; ++t) acc[t] = float8{0, 0, 0, 0, 0, 0, 0, 0};
+    for (int gb = g0; gb < g1; gb += DGS) {
+        const int groups = min(DGS, g1 - gb);
+        __syncthreads();
+        for (int i = threadIdx.x; i < MT * 16 * DGS * 4; i += 256) {
+            const int row = i / (DGS * 4), pc = i % (DGS * 4);
+            uint4 v = make_uint4(0, 0, 0, 0);
+            if (row < m && pc < groups * 4)
+                v = *reinterpret_cast<const uint4*>(x + static_cast<size_t>(row) * k + gb * 32 + pc * 8);
+            *reinterpret_cast<uint2*>(&xl[row][pc * 8]) = make_uint2(v.x, v.y);
+            *reinterpret_cast<uint2*>(&xl[row][pc * 8 + 4]) = make_uint2(v.z, v.w);
+        }
+        __syncthreads();
+        for (int j = 0; j < groups; ++j) {
+            const int g = gb + j;
+#pragma unroll
+            for (int s = 0; s < 2; ++s) {
+                const short8 b = *reinterpret_cast<const short8*>(wrow + g * 32 + 16 * s + 8 * h);
+#pragma unroll
+                for (int t = 0; t < MT; ++t) {
+                    const short8 av = *reinterpret_cast<const short8*>(&xl[16 * t + c][j * 32 + 16 * s + 8 * h]);
+                    acc[t] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(av, b, acc[t]);
+                }
+            }
+        }
+    }
+    if (col >= n) return;
+#pragma unroll
+    for (int t = 0; t < MT; ++t)
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const int row = 16 * t + 8 * h + i;
+            if (row >= m) break;
+            const float v = acc[t][i];
             if (slices > 1) part[(static_cast<size_t>(slice) * m + row) * n + col] = v;
             else if (out32 != nullptr) out32[static_cast<size_t>(row) * n + col] = v;
             else out16[static_cast<size_t>(row) * n + col] = bf16_round(v);
@@ -322,6 +389,32 @@ void decode_mx4(const at::Tensor& x, const at::Tensor& wt, const at::Tensor& sct
     else
         decode_kernel<2><<<grid, 256, 0, stream>>>(xp, m, wt.data_ptr<uint8_t>(), sct.data_ptr<uint8_t>(),
                                                    ref.data_ptr<int>(), n, k, gps, part.data_ptr<float>(), o16, o32, slices);
+    if (slices > 1) {
+        const size_t total = static_cast<size_t>(m) * n;
+        reduce_kernel<<<(total + 255) / 256, 256, 0, stream>>>(part.data_ptr<float>(), slices, total, o32, o16);
+    }
+}
+
+// x: (M, K) bf16 rows, M <= 32; w: (N, K) bf16 as stored; out and part as decode_mx4's.
+void decode_b16(const at::Tensor& x, const at::Tensor& w, at::Tensor& out, at::Tensor& part) {
+    const int m = static_cast<int>(x.size(0)), k = static_cast<int>(x.size(1)), n = static_cast<int>(w.size(0));
+    TORCH_CHECK(m <= 32 && k % 32 == 0 && w.size(1) == k && x.scalar_type() == at::kBFloat16 &&
+                w.scalar_type() == at::kBFloat16 && x.is_contiguous() && w.is_contiguous() && out.is_contiguous(),
+                "decode_b16: up to 32 contiguous bf16 rows against a contiguous bf16 (N, K) weight, K a multiple of 32");
+    if (m == 0 || n == 0) return;
+    const int kg = k / 32, slices = decode_slices(n, kg), gps = (kg + slices - 1) / slices;
+    TORCH_CHECK(slices == 1 || part.numel() >= static_cast<int64_t>(slices) * m * n, "decode_b16: scratch too small");
+    auto stream = at::cuda::getCurrentCUDAStream();
+    const dim3 grid((n + 127) / 128, slices);
+    float* o32 = out.scalar_type() == at::kFloat ? out.data_ptr<float>() : nullptr;
+    auto* o16 = o32 == nullptr ? reinterpret_cast<unsigned short*>(out.data_ptr()) : nullptr;
+    const auto* xp = reinterpret_cast<const unsigned short*>(x.data_ptr());
+    const auto* wp = reinterpret_cast<const unsigned short*>(w.data_ptr());
+    if (m <= 16) {                                       // braces: torch's hipify mangles an else-line launch
+        b16_kernel<1><<<grid, 256, 0, stream>>>(xp, m, wp, n, k, gps, part.data_ptr<float>(), o16, o32, slices);
+    } else {
+        b16_kernel<2><<<grid, 256, 0, stream>>>(xp, m, wp, n, k, gps, part.data_ptr<float>(), o16, o32, slices);
+    }
     if (slices > 1) {
         const size_t total = static_cast<size_t>(m) * n;
         reduce_kernel<<<(total + 255) / 256, 256, 0, stream>>>(part.data_ptr<float>(), slices, total, o32, o16);

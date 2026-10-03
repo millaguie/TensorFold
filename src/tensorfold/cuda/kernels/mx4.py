@@ -13,7 +13,7 @@ def _ext():
     from tensorfold.cuda.build import load
 
     here = Path(__file__).parent
-    return load(name="tensorfold_mx4_rocm_v2", sources=[str(here / "mx4_rocm.cpp"), str(here / "mx4_rocm.cu")],
+    return load(name="tensorfold_mx4_rocm_v5", sources=[str(here / "mx4_rocm.cpp"), str(here / "mx4_rocm.cu")],
                 extra_cuda_cflags=["-O3", "--fmad=false"], verbose=False)
 
 
@@ -47,6 +47,14 @@ def prompt(x: tuple[torch.Tensor, torch.Tensor, torch.Tensor], tiles: torch.Tens
 _parts: dict[torch.device, torch.Tensor] = {}
 
 
+def _part(device: torch.device, need: int) -> torch.Tensor:
+    part = _parts.get(device)
+    if part is None or part.numel() < need:
+        part = torch.empty(max(need, 1), dtype=torch.float32, device=device)
+        _parts[device] = part
+    return part
+
+
 def decode(x: torch.Tensor, tiles: torch.Tensor, scales_t: torch.Tensor, ref: torch.Tensor, n: int, *,
            f32: bool = False) -> torch.Tensor:
     """bf16 rows times the MXFP4 weight, 32 rows a launch: a row's bits do not depend on the row count."""
@@ -55,12 +63,21 @@ def decode(x: torch.Tensor, tiles: torch.Tensor, scales_t: torch.Tensor, ref: to
     m, k = x.shape
     out = torch.empty((m, n), dtype=torch.float32 if f32 else torch.bfloat16, device=x.device)
     ext = _ext()
-    slices = ext.decode_slices(n, k // 32)
-    need = slices * min(m, 32) * n
-    part = _parts.get(x.device)
-    if part is None or part.numel() < need:
-        part = torch.empty(max(need, 1), dtype=torch.float32, device=x.device)
-        _parts[x.device] = part
+    part = _part(x.device, ext.decode_slices(n, k // 32) * min(m, 32) * n)
     for a in range(0, m, 32):
         ext.decode(x[a:a + 32], tiles, scales_t, ref, n, out[a:a + 32], part)
+    return out
+
+
+def b16(x: torch.Tensor, weight: torch.Tensor, *, f32: bool = False) -> torch.Tensor:
+    """bf16 rows times a bf16 (N, K) weight as stored, 32 rows a launch, row-count invariant."""
+
+    x = x.to(torch.bfloat16).contiguous()
+    m, k = x.shape
+    n = weight.shape[0]
+    out = torch.empty((m, n), dtype=torch.float32 if f32 else torch.bfloat16, device=x.device)
+    ext = _ext()
+    part = _part(x.device, ext.decode_slices(n, k // 32) * min(m, 32) * n)
+    for a in range(0, m, 32):
+        ext.decode_b16(x[a:a + 32], weight, out[a:a + 32], part)
     return out
