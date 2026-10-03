@@ -45,6 +45,8 @@ def capture(logits, tokens, positions, probabilities, rows=None):
         logits = logits.index_select(0, torch.tensor(rows, dtype=torch.long, device=logits.device))
     if not logits.is_cuda or logits.ndim != 2 or logits.shape[0] != len(tokens) or logits.stride(1) != 1:
         raise ValueError("probabilities need CUDA target rows and one accepted token per row")
+    if logits.data_ptr() % 16:                    # Triton specializes on a 16-byte-aligned base: an unaligned row view
+        logits = logits.clone()                   # (vocab 250 in bf16, one row of a batch) got other sums, so copy it
     n, vocab = logits.shape
     tiles = tr.cdiv(vocab, 1024)
     parts = torch.empty((n, tiles, 2), dtype=torch.float32, device=logits.device)
@@ -61,8 +63,9 @@ def capture(logits, tokens, positions, probabilities, rows=None):
         ordered = torch.where(bits < 0, ~bits, bits ^ 0x80000000) - 0x80000000
         token_ids = torch.arange(vocab, dtype=torch.int64, device=logits.device)
         keys = (ordered << 32) | (0xFFFFFFFF - token_ids)
-        # ROCm's int64 topk returned an index past the row for odd widths 21-53 (torch 2.12+rocm7.14): a sort there
-        top_ids = (keys.topk(count, dim=-1, sorted=True).indices if vocab >= 64
+        # ROCm's integer topk is wrong on rows up to 250 wide holding negative values (an index past the row for one
+        # value of -5; torch 2.12+rocm7.14, both R9700s); sort agrees with the CPU there, so narrow rows sort
+        top_ids = (keys.topk(count, dim=-1, sorted=True).indices if vocab > 1024
                    else keys.sort(dim=-1, descending=True).indices[:, :count])
         scores = (logits.gather(1, top_ids).float() - lse[:, None]).cpu().tolist()
         alternatives = top_ids.cpu().tolist()

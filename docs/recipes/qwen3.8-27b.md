@@ -316,8 +316,9 @@ Open items on ROCm (from the 2026-10-03 review of the fork):
   not the lever.
 - Not done, small: the tree attention tail kernel's fold (one wave, no double buffer), a 32-column FP8 prompt GEMM
   variant for narrow outputs, `kv8.pack` a program per row instead of per (row, head).
-- ROCm's int64 `torch.topk` returned an index past the row for odd widths 21-53 (torch 2.12+rocm7.14);
-  `logprobs.capture` sorts such narrow rows instead. Not reported upstream yet.
+- ROCm's integer `torch.topk` (int32 and int64) is wrong on rows up to 250 wide holding negative values: one value
+  of -5 gives index 1, past the row (torch 2.12+rocm7.14, the same on both R9700s; float topk and integer sort
+  agree with the CPU). `logprobs.capture` sorts rows up to 1024 wide instead. Not reported upstream yet.
 
 Limits: one rank; other families and EXL3 packs are refused. `--parallel 3` was run on an R9700 with three
 48K-token streams (with `--kv-dtype fp8`; each reply equal to its solo run).

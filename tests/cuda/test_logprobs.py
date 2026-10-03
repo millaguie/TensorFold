@@ -8,7 +8,7 @@ from tensorfold.engine.probabilities import Probabilities
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
-@pytest.mark.parametrize("vocab", [31, 1024, 1025, 131073])
+@pytest.mark.parametrize("vocab", [31, 129, 249, 250, 1024, 1025, 131073])
 def test_probability_rows_match_reference_and_batching(dtype, vocab):
     g = torch.Generator(device="cuda").manual_seed(17)
     logits = torch.randn((7, vocab), generator=g, device="cuda", dtype=torch.float32).to(dtype)
