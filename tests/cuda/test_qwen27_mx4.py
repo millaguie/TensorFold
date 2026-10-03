@@ -63,11 +63,11 @@ def test_prompt_matmul_is_exact_and_chunk_invariant(n, k):
 @pytest.mark.parametrize("n,k", [(48, 5120), (1024, 5120), (17408, 5120), (5120, 17408), (5120, 6144)])
 def test_decode_rows_are_exact_and_row_count_invariant(n, k):
     q = _weight(n, k, 2 * n + k, spread=20)               # bf16 widening is exact at any shift
-    x = torch.randn(40, k, device="cuda").bfloat16()
+    x = torch.randn(60, k, device="cuda").bfloat16()
     whole = kmx.decode(x, q.tiles, q.scales_t, q.ref, n, f32=True)
     ref = x.double() @ q.dequantize().double().t()
     assert ((whole.double() - ref).norm() / ref.norm()).item() < 1e-5   # fp32 sums over K
-    for m in (1, 3, 12, 16, 17, 32, 33):
+    for m in (1, 3, 12, 16, 17, 32, 33, 40):
         assert torch.equal(kmx.decode(x[:m], q.tiles, q.scales_t, q.ref, n, f32=True), whole[:m]), m
 
 
@@ -93,9 +93,9 @@ def test_stacked_views_give_their_members_bits():
 
 def test_bf16_head_rows_are_exact_and_row_count_invariant():
     w = torch.randn(4096, 5120, device="cuda").bfloat16()
-    x = torch.randn(33, 5120, device="cuda").bfloat16()
+    x = torch.randn(50, 5120, device="cuda").bfloat16()
     whole = kmx.b16(x, w, f32=True)
     ref = x.double() @ w.double().t()
     assert ((whole.double() - ref).norm() / ref.norm()).item() < 1e-5   # fp32 sums over K
-    for m in (1, 4, 12, 17, 32):
+    for m in (1, 4, 12, 17, 32, 33, 48):
         assert torch.equal(kmx.b16(x[:m], w, f32=True), whole[:m]), m
