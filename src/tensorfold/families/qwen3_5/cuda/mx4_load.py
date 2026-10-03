@@ -22,6 +22,7 @@ from .weights import GDN, Attention, Config, Layer, Plain, Weights
 # e2m1 codes 0-15 (bit 3 the sign): 0, 0.5, 1, 1.5, 2, 3, 4, 6 and their negatives
 E2M1 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0)
 GROUP = 32
+MAX_SHIFT = 125         # e2m1's least magnitude, 0.5, stays a normal bf16 this many binades down
 
 
 def quark_mxfp4(model_dir: str | Path) -> bool:
@@ -51,7 +52,13 @@ class Mx4:
     def from_checkpoint(cls, weight: torch.Tensor, scale: torch.Tensor) -> "Mx4":
         from tensorfold.cuda.kernels.mx4 import to_tiles
 
-        return cls(to_tiles(weight), scale.t().contiguous(), scale.max(1).values.to(torch.int32).contiguous())
+        ref = scale.max(1).values
+        if int(scale.min()) < 1 or int(ref.max()) > 254:     # e8m0 0 and 255 (2^-127, NaN) never reach the kernels
+            raise ValueError("MXFP4 scales: e8m0 codes 0 and 255 are not supported")
+        if int((ref[:, None].int() - scale.int()).max()) > MAX_SHIFT:
+            raise ValueError(f"MXFP4 scales: a row's groups span more than {MAX_SHIFT} binades (decode widens each "
+                             "group to bf16 below its row's largest scale, exact to there)")
+        return cls(to_tiles(weight), scale.t().contiguous(), ref.to(torch.int32).contiguous())
 
     @property
     def n(self) -> int:
@@ -214,9 +221,10 @@ def load_mx4(model_dir: str | Path, device: str = "cuda") -> Weights:
         table = get(lm + "embed_tokens.weight").to(torch.bfloat16).contiguous()
         try:
             embed = Plain(table.pin_memory())
-        except RuntimeError as exc:                      # the host would not pin it: the GPU holds it, as before
-            print(f"[tensorfold] MXFP4: the embedding stays on the GPU ({table.nbytes / 2**30:.1f} GiB): host memory "
-                  f"would not pin it ({exc})", flush=True)
+        except RuntimeError as exc:                      # the startup estimate left it out of GPU memory: refuse
+            raise RuntimeError(f"MXFP4: host memory would not pin the {table.nbytes / 2**30:.1f} GiB embedding "
+                               f"({exc}); free host memory, or start with TF_MX4_EMBED=gpu to keep it on the GPU "
+                               "(the estimate then counts it)") from exc
         del table
     if embed is None:
         embed = Plain(dense(lm + "embed_tokens.weight").to(torch.bfloat16))

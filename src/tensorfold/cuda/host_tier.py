@@ -236,7 +236,12 @@ class HostTier:
                 for seg, _, _ in pieces:
                     seg.refs -= 1
                 pieces = []
-            else:
+            else:                                       # pinned segments fill the tier: this entry is not kept
+                self.dropped += 1
+                if self.dropped == 1:
+                    print(f"[tensorfold] RAM tier: no room for a {pos:,}-token prompt state beside the segments "
+                          "other kept states share; it is prefilled again when its conversation returns (later "
+                          "drops are counted, not printed)", flush=True)
                 return False
         chunks = [self._chunk() for _ in range(own)]
         jobs = [(_flat(t), chunks, at) for t, (_, _, at) in zip(sources, specs)]

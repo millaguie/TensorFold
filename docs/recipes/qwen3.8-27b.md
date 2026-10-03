@@ -304,8 +304,13 @@ of context (tree attention 9.7 -> 7.3 ms), 40.1 and 39.6 ms at 16k. It needs ROC
 head size 256, one rank and the WMMA attention kernels: startup refuses it on NVIDIA (which serves bf16), with
 `--tp 2`, and with `TF_ROCM_ATTN_KERNEL=triton` or `TF_ROCM_TREE_KERNEL=triton`.
 
-Limits: one rank; other families and EXL3 packs are refused; `--parallel` is untested on ROCm beyond the
-multi-stream tests. Verify windows
+Limits: one rank; other families and EXL3 packs are refused. `--parallel 3` was run on an R9700 with three
+48K-token streams (with `--kv-dtype fp8`; each reply equal to its solo run).
+
+Known issue, still open: with `--parallel` near full VRAM, PyTorch's expandable segments gave NaN on ROCm (values
+changed after kernels had finished: a matmul output read non-finite and then finite, nothing launched between). The
+same requests run clean on plain segments, so ROCm starts without them; the cause is not found. `TF_EXPANDABLE_SEGMENTS=1`
+or `0` overrides that default on either backend. Verify windows
 past 16 rows run the two-tile matmul, about a quarter slower than one tile: 16 rows helped code prompts (+13-19%)
 and hurt prose (-9%) in one test each, so `max_rows` stays 12.
 

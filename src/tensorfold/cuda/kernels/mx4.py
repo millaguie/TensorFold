@@ -44,28 +44,34 @@ def prompt(x: tuple[torch.Tensor, torch.Tensor, torch.Tensor], tiles: torch.Tens
     return out
 
 
-_parts: dict[torch.device, torch.Tensor] = {}
+# Scratch and arrival counters by (device, stream): a launch resets its counters itself, so two streams' launches in
+# flight must never share them.
+_parts: dict[tuple, torch.Tensor] = {}
 
 
-_counts: dict[torch.device, torch.Tensor] = {}
+_counts: dict[tuple, torch.Tensor] = {}
+
+
+def _key(device: torch.device) -> tuple:
+    return device, torch.cuda.current_stream(device).cuda_stream
 
 
 def _count(device: torch.device, n: int) -> torch.Tensor:
     """Arrival counters, one a 128-column block, zero between calls (the last slice of a block resets its own)."""
 
-    c = _counts.get(device)
+    c = _counts.get(_key(device))
     blocks = (n + 127) // 128
     if c is None or c.numel() < blocks:
         c = torch.zeros(max(blocks, 2048), dtype=torch.int32, device=device)
-        _counts[device] = c
+        _counts[_key(device)] = c
     return c
 
 
 def _part(device: torch.device, need: int) -> torch.Tensor:
-    part = _parts.get(device)
+    part = _parts.get(_key(device))
     if part is None or part.numel() < need:
         part = torch.empty(max(need, 1), dtype=torch.float32, device=device)
-        _parts[device] = part
+        _parts[_key(device)] = part
     return part
 
 

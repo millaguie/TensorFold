@@ -105,7 +105,9 @@ class Qwen27Engine:
         # streams' caches of many sizes come and go: growable segments, less slack. Not on ROCm: there, with --parallel 3
         # on an R9700 near full memory, values changed under finished kernels (NaN in the drafter's context, a matmul
         # output non-finite then finite), and plain segments run the same requests clean.
-        if streams > 1 and tp == 1 and not hip():
+        # TF_EXPANDABLE_SEGMENTS=1 or 0 overrides that default either way (the ROCm cause is still open).
+        growable = os.environ.get("TF_EXPANDABLE_SEGMENTS")
+        if streams > 1 and tp == 1 and (not hip() if growable is None else growable == "1"):
             torch.cuda.memory._set_allocator_settings("expandable_segments:True")
         keep = KEEP if keep is None else int(keep)         # --checkpoint-slots: each kept state is in the estimate
         if tp == 2:

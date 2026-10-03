@@ -3,6 +3,18 @@
 `tensorfold update` prints the sections below that are newer than the version you had. Each release's page on
 GitHub has the full notes and the measurements behind them.
 
+## Unreleased (rocm-r9700 fork)
+
+- **Ties between candidates break the same way everywhere.** The 27B's drafter and sampler pick tied logits by
+  value, then the lowest id (`top_by_value_then_id`): ROCm's `torch.topk` kept different ones as the row count
+  changed. A reply whose logits tie exactly may differ from 0.6.2.
+- **MXFP4 on RDNA4.** A Quark MXFP4 export of the 27B serves on gfx1201; its bf16 embedding stays in pinned host
+  memory (`TF_MX4_EMBED=gpu` keeps it on the GPU), and startup refuses e8m0 scale codes 0 and 255. Token ids outside
+  the embedding read its nearest row instead of host memory past it.
+- **`--ram-tier-gib`** keeps the prompt states the GPU cache lets go in pinned host RAM (jkuepker's #106).
+- **`--parallel` on ROCm** starts without PyTorch's expandable segments (`TF_EXPANDABLE_SEGMENTS` overrides it), and
+  the memory gate counts `--kv-dtype fp8`'s packed rows.
+
 ## 0.6.2 (2 Oct 2026)
 
 - **Flash Next on Macs at 64k-128k.** On an M3 Ultra, one stream runs 1.2-3.4% faster at 64k and 3.9-5.5% at 128k,
