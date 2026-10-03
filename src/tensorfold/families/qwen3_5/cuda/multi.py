@@ -6,7 +6,8 @@ import time
 
 import torch
 
-from tensorfold.cuda.capacity import available_bytes
+from tensorfold.cuda.build import hip
+from tensorfold.cuda.capacity import available_bytes, unified
 from tensorfold.cuda.markers import MIN_GAP
 from tensorfold.cuda.memory_gate import MemoryGate, NoRoom, torch_live
 from tensorfold.cuda.sampling import sample_streams
@@ -131,6 +132,10 @@ class MultiDecoder:
         self.row_bytes = att * self.layer_bytes
         self.memory_gate = (MemoryGate(1 << 62, reserve=2 * GIB, live=torch_live(torch, available_bytes))
                      if world == 1 and cuda else None)
+        # The gate counts the allocator's freed bytes as free, so trimming them mid-round only matters where the
+        # GPU shares the host's memory. On ROCm, a trim between rounds unmapped and remapped pages inside live
+        # expandable segments, and values changed under finished kernels (NaN): there a dedicated GPU never trims.
+        self.trims = cuda and not (hip() and not unified(torch))
 
     def live(self) -> int:
         return len(self.streams) + len(self.filling)
@@ -216,7 +221,7 @@ class MultiDecoder:
                 if not self.live():
                     return                          # alone: startup fitted one stream's whole window
                 raise NoRoom(f"a {len(s.prompt)}-token prompt waits for memory until a live stream finishes")
-            torch.cuda.empty_cache()
+            self._trim()
 
     def _grow(self, st: State, have: int, size: int, alone: bool) -> bool:
         """Grow ``st``'s caches from ``have`` to ``size`` rows while the gate has room (a layer's copy at a time)."""
@@ -226,10 +231,14 @@ class MultiDecoder:
                 if alone:
                     break                           # startup fitted one stream's whole window
                 return False
-            torch.cuda.empty_cache()
+            self._trim()
         reserve(st, size)
-        torch.cuda.empty_cache()                    # the old buffers back to the system: MemAvailable stays true
+        self._trim()                                # the old buffers back to the system: MemAvailable stays true
         return True
+
+    def _trim(self) -> None:
+        if self.trims:
+            torch.cuda.empty_cache()
 
     def _make_room(self, live: list[Stream]) -> list[Stream]:
         """Before a round: grow window caches oldest-first; no-growth streams run; the newest may end."""
@@ -255,7 +264,7 @@ class MultiDecoder:
             self.memory_gate.ends += 1
             self.streams.pop(newest.sid, None)
             newest.st = None                         # its caches go now (a cached prompt end may still view them)
-            torch.cuda.empty_cache()
+            self._trim()
             return [newest, *self._make_room(live[:-1])]
         self.memory_gate.waits += any(s.waiting for s in live)
         return []
