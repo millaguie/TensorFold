@@ -827,6 +827,10 @@ def test_a_ram_tier_the_host_cannot_hold_is_refused_before_any_download(tmp_path
 
     monkeypatch.setattr(capacity, "host_room", lambda: room)
     monkeypatch.setattr(capacity, "unified", lambda torch: shared)
+    try:
+        import torch  # noqa: F401
+    except ImportError:                     # a host without torch: the GPU's kind is asked of a stand-in
+        monkeypatch.setitem(sys.modules, "torch", types.ModuleType("torch"))
     found = SimpleNamespace(title=qwen3_5.TITLE, package=qwen3_5, model_type="qwen3_5")
     monkeypatch.setattr(families, "detect", lambda path: found)
     monkeypatch.setattr(cli, "_backend", lambda choice, fam: "cuda")
@@ -885,7 +889,7 @@ def test_the_27b_engine_gets_the_tier_in_bytes(tmp_path, monkeypatch):
 def test_reserve_carves_the_budget_into_free_chunks_up_front():
     """``reserve`` takes the whole budget in power-of-two slabs (none past it); puts then use those chunks."""
 
-    import torch
+    torch = pytest.importorskip("torch")
 
     tier = _tier(5 * 64 + 32, 32, pin=True)
     tier._alloc = lambda pinned: pytest.fail("a put allocated a chunk after reserve")
