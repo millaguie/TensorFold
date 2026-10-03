@@ -372,6 +372,7 @@ void gemv_groups(const at::Tensor& x, const at::Tensor& xs, const at::Tensor& wo
                  const at::Tensor& biases, int n, at::Tensor& out, at::Tensor& part, bool wmma, int fill,
                  at::Tensor& counts) {
     const int kg = words.size(1), m = x.size(0);
+    TORCH_CHECK(x.stride(1) == 1 && x.stride(0) % 2 == 0, "gemv_groups: bf16 rows of an even stride");
     const int slices = wmma ? wmma_slices(kg, n, fill) : gemv_slices(kg);
     const int gps = kg / slices;
     auto stream = at::hip::getCurrentHIPStream();

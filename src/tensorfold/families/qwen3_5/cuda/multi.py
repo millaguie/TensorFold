@@ -161,7 +161,8 @@ class MultiDecoder:
             raise ValueError("image inputs require starting this engine with --vision")
         encoded = self.vision.encode(prepared, s.prompt) if prepared is not None else None
         hit = self.cache.longest(s.prompt) if s.draft and encoded is None else None
-        back = (self.tier.take(s.prompt, len(hit[0]) if hit else 0, rows=self._most(s))
+        rows = self._most(s) if self.memory_gate is None else self._first(s)    # what _room just let in
+        back = (self.tier.take(s.prompt, len(hit[0]) if hit else 0, rows=rows)
                 if self.tier is not None and s.draft and encoded is None else None)
         if back is not None:        # a longer match in host RAM, in buffers of the stream's size: the stream resumes
             ids, st, snap = back    # in them; the cache views their rows below pos and keeps its own DeltaNet states,

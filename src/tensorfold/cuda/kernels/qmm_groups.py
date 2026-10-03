@@ -222,7 +222,11 @@ def gemv(x: torch.Tensor, words: torch.Tensor, scales: torch.Tensor, biases: tor
     return out
 
 
-_arrivals: dict[torch.device, torch.Tensor] = {}
+_arrivals: dict[tuple, torch.Tensor] = {}         # by (device, stream): a launch resets its own counters
+
+
+def _key(device: torch.device) -> tuple:
+    return device, torch.cuda.current_stream(device).cuda_stream
 
 
 def _counts(device: torch.device, n: int) -> torch.Tensor:
@@ -230,10 +234,10 @@ def _counts(device: torch.device, n: int) -> torch.Tensor:
     last block of a column resets it), so one stream's calls share them."""
 
     need = -(-n // 128)
-    buf = _arrivals.get(device)
+    buf = _arrivals.get(_key(device))
     if buf is None or buf.numel() < need:
         buf = torch.zeros(max(need, 4096), dtype=torch.int32, device=device)
-        _arrivals[device] = buf
+        _arrivals[_key(device)] = buf
     return buf
 
 
@@ -321,18 +325,18 @@ def _gemm(X, W, OUT, M, N: tl.constexpr, K: tl.constexpr, BM: tl.constexpr, BN: 
     tl.store(OUT + rm[:, None] * N + rn[None, :], acc.to(OUT.dtype.element_ty), mask=m_ok[:, None] & n_ok[None, :])
 
 
-_scratch: dict[torch.device, torch.Tensor] = {}
+_scratch: dict[tuple, torch.Tensor] = {}
 
 
 def _buffer(device: torch.device, nbytes: int) -> torch.Tensor:
     """A byte buffer reused by the next prompt matmul on this device (one stream's prompt matmuls run in order, so a
     projection's weights are consumed before the next one overwrites them)."""
 
-    buf = _scratch.get(device)
+    buf = _scratch.get(_key(device))
     if buf is None or buf.numel() < nbytes:
-        _scratch.pop(device, None)
+        _scratch.pop(_key(device), None)
         buf = torch.empty(nbytes, dtype=torch.uint8, device=device)
-        _scratch[device] = buf
+        _scratch[_key(device)] = buf
     return buf[:nbytes]
 
 

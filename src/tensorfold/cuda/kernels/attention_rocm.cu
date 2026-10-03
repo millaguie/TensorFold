@@ -55,9 +55,12 @@ constexpr int LOADERS = 4;                  // loader waves a block
 constexpr int NL = 32 * LOADERS;            // loader threads
 constexpr int ROW8 = D + 16;                // a packed FP8 row: 256 e4m3 bytes, the int8 exponent, padding
 
+// 48-byte rows: the eight lanes of a 16-byte B-fragment read phase land on distinct banks (32-byte rows: two-way)
+constexpr int VPAD = 24;
+
 struct Tile {
     unsigned short k[16][D + KPAD];         // keys by row
-    unsigned short vt[D][16];               // values transposed: B operand rows are keys
+    unsigned short vt[D][VPAD];             // values transposed: B operand rows are keys
 };
 
 // Piece i of a tile into shared memory: K by rows (key i / 32), V keys first (key i % 16) so a wave's transposed

@@ -110,3 +110,12 @@ def test_host_table_rows_are_the_stored_rows():
     assert kmx.host_rows(torch.empty(0, dtype=torch.int64, device="cuda"), table).shape == (0, 5120)
     edge = kmx.host_rows(torch.tensor([-3, 5000, 9999], device="cuda"), table).cpu()     # clamped, never past it
     assert torch.equal(edge, table[[0, 4999, 4999]])
+
+
+@pytest.mark.parametrize("pair", [(0, 120), (120, 255), (1, 127)])     # e8m0 0, e8m0 255, a 126-binade spread
+def test_scales_the_kernels_cannot_widen_exactly_are_refused(pair):
+    words = torch.zeros((16, 32), dtype=torch.uint8, device="cuda")
+    scales = torch.full((16, 2), 120, dtype=torch.uint8, device="cuda")
+    scales[3] = torch.tensor(pair, dtype=torch.uint8)
+    with pytest.raises(ValueError, match="MXFP4 scales"):
+        Mx4.from_checkpoint(words, scales)

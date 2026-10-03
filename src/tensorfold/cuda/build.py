@@ -64,7 +64,8 @@ def arch_flags(need: tuple[int, int] = MIN_CAPABILITY, arch_specific: bool = Fal
     import torch
 
     if hip():                                       # hipcc: one AMD target; the portable paths avoid clusters and FP8 MMA
-        return [f"--offload-arch={hip_arch()}"]
+        # every ROCm kernel's lane math is wave32's (RDNA's default): pinned, so a changed default can't break them
+        return [f"--offload-arch={hip_arch()}", "-mno-wavefrontsize64"]
     major, minor = torch.cuda.get_device_capability()
     if (major, minor) < need:
         why = "thread-block clusters" if need >= CLUSTERS else "FP8 MMA"

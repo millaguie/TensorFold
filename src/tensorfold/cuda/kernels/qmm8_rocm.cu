@@ -292,6 +292,8 @@ __global__ void __launch_bounds__(32 * WM * WN) gemm8_kernel(
 template <int BM, int BN, int WM, int WN, int GPS, int NB, bool LDSBAR = false, bool W4 = false>
 void launch(const at::Tensor& x8, const at::Tensor& xs, const at::Tensor& a, const at::Tensor& w8,
             const at::Tensor& scales, const at::Tensor& biases, int m, int n, int k, int group, at::Tensor& out) {
+    TORCH_CHECK(scales.is_contiguous() && biases.is_contiguous() && scales.scalar_type() == at::kBFloat16 &&
+                biases.scalar_type() == at::kBFloat16, "prompt FP8 matmul: contiguous bf16 scales and biases");
     const int blocks = ((m + BM - 1) / BM) * ((n + BN - 1) / BN);
     gemm8_kernel<BM, BN, WM, WN, GPS, NB, LDSBAR, W4><<<blocks, 32 * WM * WN, 0, at::cuda::getCurrentCUDAStream()>>>(
         x8.data_ptr<uint8_t>(), reinterpret_cast<const unsigned short*>(xs.data_ptr()), a.data_ptr<float>(),
@@ -485,6 +487,8 @@ __global__ void __launch_bounds__(256) gemm8_tiled_kernel(
 template <int TN, int GPS, bool SEQ>
 void launch_tiled(const at::Tensor& x8, const at::Tensor& xs, const at::Tensor& a, const at::Tensor& words,
                   const at::Tensor& scales, const at::Tensor& biases, int m, int n, int k, at::Tensor& out) {
+    TORCH_CHECK(scales.is_contiguous() && biases.is_contiguous() && scales.scalar_type() == at::kBFloat16 &&
+                biases.scalar_type() == at::kBFloat16, "prompt FP8 matmul: contiguous bf16 scales and biases");
     constexpr int BN = 32 * TN;
     const dim3 grid((n + BN - 1) / BN, (m + 255) / 256);
     gemm8_tiled_kernel<TN, GPS, SEQ><<<grid, 256, 0, at::cuda::getCurrentCUDAStream()>>>(

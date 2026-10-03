@@ -167,7 +167,7 @@ __global__ void __launch_bounds__(256) prompt_kernel(
 
 // ------------------------------------------------------------------------------------------------------ decode rows
 // ``decode_kernel``: up to 16 MT bf16 rows (decode, a draft window's verify rows) times the weights on bf16 WMMA. A
-// group's codes widen to bf16 as value * 2^-(reference - scale), exact for any shift (bf16 keeps fp32's exponent), so
+// group's codes widen to bf16 as value * 2^-(reference - scale), exact for shifts up to 125 (mx4_load refuses more), so
 // the K loop is WMMAs alone; the column's 2^(reference - 127) comes at the end. K splits into slices fixed by the
 // weight's shape (never by the row count), whose sums ``reduce_kernel`` adds in slice order, so a row's bits are the
 // same in any call. Memory bound: a block's 8 waves take 16 columns each, every lane reading its column's 16 bytes a
