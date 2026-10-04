@@ -83,6 +83,9 @@ class Health:
         if decoder is not None:                         # read, never locked: sizes of the decoder's own tables
             body["streams"] = {"decoding": len(getattr(decoder, "streams", ())),
                                "prefilling": len(getattr(decoder, "filling", ())), "max": scheduler.max_streams}
+        tier = getattr(getattr(app, "engine", None), "tier", None)
+        if tier is not None:                            # the 27B's --ram-tier-gib: read, never locked, as above
+            body["ram_tier"] = tier.stats()
         window = getattr(app, "effective_context_window", None)
         if window:
             body["context_length"] = int(window)

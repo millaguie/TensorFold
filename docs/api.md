@@ -227,8 +227,10 @@ On CUDA, `GET /health` also carries counters a poller can difference into rates:
 `requests_total`, `completion_tokens_total` (the running replies' tokens included as they stream), and totals that
 move when a request ends, taken from the engine's own statistics: `prompt_tokens_total`, `cached_tokens_total`,
 `prefill_seconds_total`, `decode_seconds_total`, `rounds_total`, and `drafted_total` and `accepted_total` where the
-engine reports them. A `--parallel` server adds `streams` (decoding, prefilling and the maximum), and
-`context_length` is the served window. The first sample is a baseline, not a rate.
+engine reports them. A `--parallel` server adds `streams` (decoding, prefilling and the maximum), a
+`--ram-tier-gib` server adds `ram_tier` (its `entries` and `segments`, `used` and `budget` bytes, bytes copied
+`to_host` and `from_host`, and states `dropped` as too big), and `context_length` is the served window. The first
+sample is a baseline, not a rate.
 
 For exactness comparisons, hold the checkpoint, template, runtime, prompt, seed and sampling settings
 constant, then compare the decoded reply with `draft` enabled and disabled. Repeat with fresh and reused

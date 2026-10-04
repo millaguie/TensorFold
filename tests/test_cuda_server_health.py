@@ -90,10 +90,19 @@ def test_a_concurrent_engine_reports_its_streams(tmp_path):
     assert health.of(app) is health.of(app)
 
 
+def test_an_engine_with_a_ram_tier_reports_it(tmp_path):
+    stats = {"entries": 2, "segments": 3, "used": 5, "budget": 8, "to_host": 13, "from_host": 21, "dropped": 1}
+    engine = PacedEngine()
+    engine.tier = SimpleNamespace(stats=lambda: dict(stats))
+    app = app_for(tmp_path, engine)
+    assert health.of(app).snapshot(app)["ram_tier"] == stats
+
+
 def test_a_bare_app_still_answers(tmp_path):
     app = SimpleNamespace(served="fake")
     body = health.of(app).snapshot(app)
     assert body["ok"] is True and body["busy"] is False and "streams" not in body and "context_length" not in body
+    assert "ram_tier" not in body
 
 
 def test_a_concurrent_stream_reports_its_drafted_rows_and_kept_drafts():
