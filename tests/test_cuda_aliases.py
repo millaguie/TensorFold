@@ -55,6 +55,10 @@ def test_a_reply_names_the_id_it_was_asked_for_when_it_answers_to_it(tmp_path, a
 
 
 def test_serve_hands_the_aliases_to_the_cuda_app(tmp_path, monkeypatch):
+    from tensorfold.cuda import build
+
+    monkeypatch.setattr(build, "hip", lambda: False)     # the test family stands in for NVIDIA's, also on a ROCm host
+    monkeypatch.setattr(build, "gfx12", lambda: False)
     made = []
     family = SimpleNamespace(title="Test family", model_type="test",
                              package=SimpleNamespace(cuda_engine=lambda *a, **k: SimpleNamespace(max_len=8192)))

@@ -17,6 +17,9 @@ def _nvidia(monkeypatch):
 
     monkeypatch.setattr(build, "hip", lambda: False)
     monkeypatch.setattr(build, "gfx12", lambda: False)
+    # an engine built for --parallel would then turn on expandable segments, for the whole process and every later
+    # test on this ROCm host (pytorch/pytorch#195202): keep plain ones
+    monkeypatch.setenv("TF_EXPANDABLE_SEGMENTS", "0")
 
 GPUS = [((8, 6), "NVIDIA GeForce RTX 3090"), ((8, 9), "NVIDIA GeForce RTX 4090"), ((9, 0), "NVIDIA H100"),
         ((12, 1), "NVIDIA GB10")]

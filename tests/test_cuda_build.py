@@ -295,7 +295,7 @@ def test_a_toolkit_torch_found_or_no_pip_toolkit_changes_nothing(tmp_path, monke
 @pytest.mark.torch
 def test_rocm_builds_for_the_amd_gpu_present(monkeypatch):
     _amd(monkeypatch)
-    assert build.arch_flags() == ["--offload-arch=gfx1201"]
+    assert build.arch_flags() == ["--offload-arch=gfx1201", "-mno-wavefrontsize64"]
 
 
 @pytest.mark.torch
@@ -307,7 +307,7 @@ def test_rocm_takes_hipcc_equivalents_of_nvcc_flags(monkeypatch, tmp_path):
     monkeypatch.setattr(ext, "load", lambda **kw: seen.update(kw) or "module")
     monkeypatch.setenv("TORCH_EXTENSIONS_DIR", str(tmp_path))     # load looks up the build directory
     build.load(name="x", sources=[], extra_cuda_cflags=["-O3", "--fmad=false", "--expt-relaxed-constexpr", "-lineinfo"])
-    assert seen["extra_cuda_cflags"] == ["-O3", "-ffp-contract=off", "--offload-arch=gfx1201"]
+    assert seen["extra_cuda_cflags"] == ["-O3", "-ffp-contract=off", "--offload-arch=gfx1201", "-mno-wavefrontsize64"]
 
 
 @pytest.mark.torch
@@ -317,4 +317,4 @@ def test_a_build_only_rocm_host_names_its_target(monkeypatch):
     monkeypatch.setattr(build, "hip", lambda: True)
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
     monkeypatch.setenv("PYTORCH_ROCM_ARCH", "gfx1201;gfx942")
-    assert build.arch_flags() == ["--offload-arch=gfx1201"]
+    assert build.arch_flags() == ["--offload-arch=gfx1201", "-mno-wavefrontsize64"]

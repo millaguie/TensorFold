@@ -17,6 +17,9 @@ def _nvidia(monkeypatch):
 
     monkeypatch.setattr(build, "hip", lambda: False)
     monkeypatch.setattr(build, "gfx12", lambda: False)
+    # an engine built for --parallel would then turn on expandable segments, for the whole process and every later
+    # test on this ROCm host (pytorch/pytorch#195202): keep plain ones
+    monkeypatch.setenv("TF_EXPANDABLE_SEGMENTS", "0")
 
 
 def test_the_flag_parses_and_defaults_to_the_checkpoints_math():

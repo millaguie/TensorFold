@@ -228,8 +228,8 @@ def test_fp8_on_rocm_admits_a_longer_window_on_the_same_budget(tmp_path, monkeyp
 
 
 @pytest.mark.parametrize("hip,head_dim,tp,env,message", [
-    (False, 256, 1, None, "NVIDIA serves bf16"),
-    (True, 256, 2, None, "drop --tp 2"),
+    (False, 256, 1, None, "other GPUs serve bf16"),
+    (True, 256, 2, None, "on AMD GPUs serve one rank"),        # ROCm refuses two ranks before any cache check
     (True, 64, 1, None, "not head size 64"),
     (True, 256, 1, "TF_ROCM_ATTN_KERNEL", "TF_ROCM_ATTN_KERNEL=triton"),
     (True, 256, 1, "TF_ROCM_TREE_KERNEL", "TF_ROCM_TREE_KERNEL=triton"),
@@ -243,6 +243,7 @@ def test_fp8_is_refused_before_loading_where_no_kernel_reads_it(tmp_path, monkey
     checkpoint(tmp_path, dict(small_config(), head_dim=head_dim), HEAD)
     monkeypatch.setattr(torch.version, "hip", "7.14" if hip else None)
     build.hip.cache_clear()
+    monkeypatch.setattr(build, "gfx12", lambda: hip)          # the WMMA kernels' GPU, whatever GPU runs the test
     if env:
         monkeypatch.setenv(env, "triton")
     try:
