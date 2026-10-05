@@ -286,6 +286,9 @@ __global__ void __launch_bounds__(256) decode_kernel(
             *reinterpret_cast<uint2*>(&xl[row][pc * 8 + 4]) = make_uint2(v.z, v.w);
         }
         __syncthreads();
+        // four groups' loads in flight a lane, not one: the 27B's gate_up 0.27 -> 0.20 ms on an R9700 at 16 rows
+        // (61 -> 86 % of the card's 555 GB/s read); the WMMAs keep their order, so the same bits
+#pragma unroll 4
         for (int j = 0; j < groups; ++j) {
             const int g = gb + j;
             const uint4 gw = *reinterpret_cast<const uint4*>(wt + ((static_cast<size_t>(colc >> 4) * kg + g) * 16 + (colc & 15)) * 16);
@@ -332,6 +335,7 @@ __global__ void __launch_bounds__(256) b16_kernel(
             *reinterpret_cast<uint2*>(&xl[row][pc * 8 + 4]) = make_uint2(v.z, v.w);
         }
         __syncthreads();
+#pragma unroll 4                                         // as in decode_kernel: the 27B's head 5.8 -> 4.4 ms
         for (int j = 0; j < groups; ++j) {
             const int g = gb + j;
 #pragma unroll
