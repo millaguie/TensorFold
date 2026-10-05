@@ -212,6 +212,9 @@ def causal_attend(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, scale: floa
     return torch.cat(pieces, dim=2)
 
 
+_CONV_TYPES = (torch.float32, torch.float16, torch.bfloat16)
+
+
 def causal_conv(x: torch.Tensor, weight: torch.Tensor, state: torch.Tensor | None, *,
                 exact: bool = False, in_place: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
     """Depthwise causal conv; ``exact`` keeps the prefill loop, ``in_place`` keeps the state's buffer."""
@@ -230,6 +233,20 @@ def causal_conv(x: torch.Tensor, weight: torch.Tensor, state: torch.Tensor | Non
         return y.view(batch, 1, channels), state
     if state is None:
         state = x.new_zeros(batch, kernel - 1, channels)
+    if x.is_cuda and length > 1 and 1 <= kernel <= 8 and length <= 65535 and x.dtype in _CONV_TYPES:
+        # The loop below in one kernel, the same products and adds in the same order: the same bits.
+        from tensorfold.rocm.kernels.act import conv_prefill
+
+        y = conv_prefill(x.contiguous(), weight.float().contiguous(), state.float().contiguous())
+        kept = kernel - 1
+        if length >= kept:
+            tail = x[:, length - kept:].float()
+        else:
+            tail = torch.cat((state.float(), x.float()), dim=1)[:, length:]
+        if in_place and state.dtype == torch.float32:
+            state.copy_(tail)
+            return y, state
+        return y, tail.contiguous()
     window = torch.cat((state.float(), x.float()), dim=1)
     out = torch.zeros(batch, length, channels, device=x.device, dtype=torch.float32)
     taps = weight.float()

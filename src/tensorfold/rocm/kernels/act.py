@@ -34,6 +34,14 @@ def conv_decode(x: torch.Tensor, weight: torch.Tensor, state: torch.Tensor) -> t
     return y
 
 
+def conv_prefill(x: torch.Tensor, weight: torch.Tensor, state: torch.Tensor) -> torch.Tensor:
+    """A prompt's depthwise conv and silu, fp32 out. ``state`` [B, K - 1, C] fp32 is only read."""
+
+    y = torch.empty(x.shape, dtype=torch.float32, device=x.device)
+    _ext().conv_prefill(x, weight, state, y)
+    return y
+
+
 def rope_decode(x: torch.Tensor, pos: "int | torch.Tensor", rotary: int, theta: float) -> torch.Tensor:
     """Rotate the first ``rotary`` columns of one position: an int, or an int32 device scalar read at run time."""
 

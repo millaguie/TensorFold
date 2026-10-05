@@ -76,6 +76,41 @@ def test_decode_conv_matches_the_loop():
     assert torch.allclose(new_state, window[:, 1:].contiguous(), rtol=1e-5, atol=1e-5)
 
 
+def _conv_loop(x, weight, state):
+    window = torch.cat((state.float(), x.float()), dim=1)
+    out = torch.zeros(x.shape, device="cuda")
+    for tap in range(weight.shape[1]):
+        out.add_(window[:, tap:tap + x.shape[1]] * weight[:, tap].view(1, 1, -1))
+    return torch.nn.functional.silu(out), window[:, x.shape[1]:].contiguous()
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize("length", [2, 3, 37, 600])
+def test_prompt_conv_keeps_the_loops_bits(dtype, length):
+    g = torch.Generator(device="cuda").manual_seed(6)
+    weight = torch.randn(96, 4, generator=g, device="cuda")
+    state = torch.randn(2, 3, 96, generator=g, device="cuda") * 8
+    x = (torch.randn(2, length, 96, generator=g, device="cuda") * 8).to(dtype)
+    ref, ref_state = _conv_loop(x, weight, state)
+    got, new_state = causal_conv(x, weight, state.clone(), exact=True)
+    assert torch.equal(got.view(torch.int32), ref.view(torch.int32))
+    assert torch.equal(new_state, ref_state)
+    kept = state.clone()
+    got, same = causal_conv(x, weight, kept, exact=True, in_place=True)
+    assert same is kept and torch.equal(kept, ref_state)
+    assert torch.equal(got.view(torch.int32), ref.view(torch.int32))
+
+
+def test_prompt_conv_resumed_equals_fresh():
+    g = torch.Generator(device="cuda").manual_seed(7)
+    weight = torch.randn(64, 4, generator=g, device="cuda")
+    x = torch.randn(1, 50, 64, generator=g, device="cuda", dtype=torch.bfloat16)
+    whole, _ = causal_conv(x, weight, None, exact=True)
+    head, state = causal_conv(x[:, :2], weight, None, exact=True)
+    tail, _ = causal_conv(x[:, 2:], weight, state, exact=True)
+    assert torch.equal(torch.cat((head, tail), dim=1), whole)
+
+
 def test_decode_rope_matches_the_formula():
     g = torch.Generator(device="cuda").manual_seed(5)
     x = torch.randn(2, 4, 1, 64, generator=g, device="cuda", dtype=torch.bfloat16)

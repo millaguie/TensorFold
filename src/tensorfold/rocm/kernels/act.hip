@@ -76,6 +76,30 @@ __global__ void conv_decode_kernel(const float* __restrict__ x, const float* __r
     if (kept > 0) state[(static_cast<long long>(batch) * kept + kept - 1) * channels + channel] = sample;
 }
 
+// A prompt's causal conv, the host loop's arithmetic in one pass: out = 0, then each tap's product rounded and added
+// in tap order (the build keeps fp-contract off), then silu as torch's x / (1 + exp(-x)). Row t's window is the
+// state's rows then x's; the new state is the window's last rows and stays on the host.
+template <typename T>
+__global__ void conv_prefill_kernel(const T* __restrict__ x, const float* __restrict__ weight,
+                                    const float* __restrict__ state, float* __restrict__ y, int length, int channels,
+                                    int kernel) {
+    const int channel = blockIdx.x * blockDim.x + threadIdx.x;
+    const int t = blockIdx.y;
+    const int batch = blockIdx.z;
+    if (channel >= channels) return;
+    const float* row = weight + static_cast<long long>(channel) * kernel;
+    const int kept = kernel - 1;
+    float acc = 0.f;
+    for (int tap = 0; tap < kernel; ++tap) {
+        const int at = t + tap;                       // the window's row
+        const float v = at < kept ? state[(static_cast<long long>(batch) * kept + at) * channels + channel]
+                                  : static_cast<float>(x[(static_cast<long long>(batch) * length + at - kept) *
+                                                         channels + channel]);
+        acc = acc + v * row[tap];
+    }
+    y[(static_cast<long long>(batch) * length + t) * channels + channel] = acc / (1.f + expf(-acc));
+}
+
 __global__ void rope_decode_kernel(const float* __restrict__ x, float* __restrict__ y, int width, int rotary,
                                    int pos, float theta, const int* __restrict__ pos_dev) {
     if (pos_dev != nullptr) pos = *pos_dev;
@@ -272,6 +296,24 @@ void conv_decode_launch(const float* x, const float* weight, float* state, float
     tf::rocm::conv_decode_kernel<<<grid, block, 0, stream>>>(x, weight, state, y, channels, kernel);
     hipError_t err = hipGetLastError();
     if (err != hipSuccess) throw std::runtime_error(std::string("conv kernel: ") + hipGetErrorString(err));
+}
+
+void conv_prefill_launch(const void* x, int kind, const float* weight, const float* state, float* y, int batch,
+                         int length, int channels, int kernel, hipStream_t stream) {
+    dim3 block(128);
+    dim3 grid((channels + 127) / 128, length, batch);
+    if (kind == 2) {
+        tf::rocm::conv_prefill_kernel<<<grid, block, 0, stream>>>(static_cast<const hip_bfloat16*>(x), weight, state,
+                                                                   y, length, channels, kernel);
+    } else if (kind == 1) {
+        tf::rocm::conv_prefill_kernel<<<grid, block, 0, stream>>>(static_cast<const __half*>(x), weight, state, y,
+                                                                   length, channels, kernel);
+    } else {
+        tf::rocm::conv_prefill_kernel<<<grid, block, 0, stream>>>(static_cast<const float*>(x), weight, state, y,
+                                                                   length, channels, kernel);
+    }
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess) throw std::runtime_error(std::string("conv prefill kernel: ") + hipGetErrorString(err));
 }
 
 void rope_decode_launch(const float* x, float* y, int rows, int width, int rotary, int pos, float theta,

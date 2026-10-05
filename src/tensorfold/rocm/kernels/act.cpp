@@ -57,6 +57,30 @@ void conv_decode(const at::Tensor& x, const at::Tensor& weight, at::Tensor& stat
                        static_cast<int>(batch), static_cast<int>(channels), static_cast<int>(kernel), stream.stream());
 }
 
+void conv_prefill(const at::Tensor& x, const at::Tensor& weight, const at::Tensor& state, at::Tensor& y) {
+    const auto type = x.scalar_type();
+    TORCH_CHECK(x.is_cuda() && x.is_contiguous() && x.dim() == 3 &&
+                    (type == at::kFloat || type == at::kHalf || type == at::kBFloat16),
+                "x: (batch, length, channels) fp32, fp16 or bf16");
+    const int64_t batch = x.size(0), length = x.size(1), channels = x.size(2);
+    TORCH_CHECK(weight.is_cuda() && weight.is_contiguous() && weight.scalar_type() == at::kFloat && weight.dim() == 2 &&
+                    weight.size(0) == channels && weight.size(1) >= 1 && weight.size(1) <= 8,
+                "weight: (channels, kernel) fp32, kernel 1..8");
+    const int64_t kernel = weight.size(1);
+    TORCH_CHECK(state.is_cuda() && state.is_contiguous() && state.scalar_type() == at::kFloat &&
+                    state.sizes() == at::IntArrayRef({batch, kernel - 1, channels}),
+                "state: (batch, kernel - 1, channels) fp32");
+    TORCH_CHECK(y.is_cuda() && y.is_contiguous() && y.scalar_type() == at::kFloat && y.sizes() == x.sizes(), "y");
+    TORCH_CHECK(length <= 65535, "length: at most 65535 a launch");
+    c10::cuda::CUDAGuard guard(x.device());
+    auto stream = c10::cuda::getCurrentCUDAStream();
+    for (const at::Tensor& tensor : {x, weight, state, y}) keep(tensor, stream);
+    const int kind = type == at::kHalf ? 1 : type == at::kBFloat16 ? 2 : 0;
+    conv_prefill_launch(x.data_ptr(), kind, weight.data_ptr<float>(), state.data_ptr<float>(), y.data_ptr<float>(),
+                        static_cast<int>(batch), static_cast<int>(length), static_cast<int>(channels),
+                        static_cast<int>(kernel), stream.stream());
+}
+
 void rope_decode(const at::Tensor& x, at::Tensor& y, int64_t pos, int64_t rotary, double theta,
                  const c10::optional<at::Tensor>& pos_dev) {
     TORCH_CHECK(x.is_cuda() && x.is_contiguous() && x.scalar_type() == at::kFloat && x.dim() == 2, "x: (rows, d) fp32");
@@ -195,5 +219,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("moe_combine", &moe_combine);
     m.def("rms", &rms);
     m.def("conv_decode", &conv_decode);
+    m.def("conv_prefill", &conv_prefill);
     m.def("rope_decode", &rope_decode);
 }
