@@ -147,7 +147,8 @@ __global__ void __launch_bounds__(32 * kRowWaves) affine_dot2_row(Affine a, int 
     float acc = 0.f;
     // bf16 tables a whole number of rounds wide: the folding lane loads its column's scales and biases for the round
     // in 16-byte pieces before the passes, not one by one after the barrier. The fold's arithmetic is unchanged.
-    const bool vec = a.scale.kind == kScaleBF16 && a.bias.kind == kScaleBF16 && lpc >= 8 && groups % lpc == 0;
+    const bool vec = a.scale.kind == kScaleBF16 && a.bias.kind == kScaleBF16 && lpc >= 8 && groups % lpc == 0 &&
+                     ((reinterpret_cast<uintptr_t>(a.scale.p) | reinterpret_cast<uintptr_t>(a.bias.p)) & 15) == 0;
     for (int g0 = 0; g0 < groups; g0 += lpc) {
         const int g = g0 + j;
         const bool live = g < groups;

@@ -422,15 +422,17 @@ def test_one_routed_launch_equals_each_expert_alone(bits, group, rows):
         assert torch.equal(got[pairs.cuda()], want), (bits, group, rows, e)
 
 
+@pytest.mark.parametrize("width", [256, 2048])
 @pytest.mark.parametrize("rows", [1, 2, 7, 33])
-def test_the_router_row_does_not_depend_on_the_rows_beside_it(rows):
-    """A row's logits are the same alone or among others, and match the fp64 product closely."""
+def test_the_router_row_does_not_depend_on_the_rows_beside_it(rows, width):
+    """A row's logits are the same alone or among others, and match the fp64 product closely. Width 2048 is the
+    register-tiled router (a tile of 32 rows), 256 the plain one."""
 
     from tensorfold.rocm.kernels.act import moe_router
 
     gen = torch.Generator().manual_seed(rows)
-    x = (torch.randn((rows, 256), generator=gen) * 0.5).to(_ACT).cuda()
-    w = torch.randn((_EXPERTS + 1, 256), generator=gen).to(torch.bfloat16).float().cuda()
+    x = (torch.randn((rows, width), generator=gen) * 0.5).to(_ACT).cuda()
+    w = torch.randn((_EXPERTS + 1, width), generator=gen).to(torch.bfloat16).float().cuda()
     together = torch.empty((rows, _EXPERTS + 1), device="cuda")
     moe_router(x, w, together)
     for r in range(rows):
@@ -438,7 +440,7 @@ def test_the_router_row_does_not_depend_on_the_rows_beside_it(rows):
         moe_router(x[r:r + 1].contiguous(), w, alone)
         assert torch.equal(alone[0], together[r])
     want = x.double() @ w.double().t()
-    assert torch.allclose(together.double(), want, rtol=1e-5, atol=1e-4)
+    assert torch.allclose(together.double(), want, rtol=1e-5, atol=1e-4 * width / 256)
 
 
 def test_one_row_writes_its_own_plan():

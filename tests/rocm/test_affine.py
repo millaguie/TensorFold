@@ -381,17 +381,21 @@ def test_fp16_gemm_tile_matches_the_one_thread_kernel(bits, group):
 
 @pytest.mark.parametrize("bits", [2, 3, 4, 5, 6, 8])
 @pytest.mark.parametrize("group", [32, 64, 128])
-def test_bf16_dot2_rows_keep_their_bits_on_gfx11(bits, group):
-    """gfx11 BF16 dot2 tiles: a row's bits are the same alone, in a short batch and in a prefill tile."""
+@pytest.mark.parametrize("groups", [10, 8, 32])
+def test_bf16_dot2_rows_keep_their_bits_on_gfx11(bits, group, groups):
+    """gfx11 BF16 dot2 tiles: a row's bits are the same alone, in a short batch and in a prefill tile, and the
+    decode tile's own bf16 rounding equals the cast of its fp32 result. 8 and 32 groups take the one-row tile's
+    vector loads of the scales and biases; 10 its scalar ones."""
 
     if gfx_name() not in WMMA:
         pytest.skip("the BF16 dot2 tiles are the gfx11 / gfx12 schedule")
-    k = group * 10
+    k = group * groups
     codes, words, scale, bias = _pack(150, k, bits, group, bits * 31 + group)
     words, scale, bias = words.cuda(), scale.to(torch.bfloat16).cuda(), bias.to(torch.bfloat16).cuda()
     x = torch.randn((70, k), device="cuda", dtype=torch.bfloat16)
     tall = matmul(x, words, scale, bias, bits=bits, group=group, f32=True)
     for m in (1, 2, 5, 8):
         assert torch.equal(matmul(x[:m], words, scale, bias, bits=bits, group=group, f32=True), tall[:m]), m
+        assert torch.equal(matmul(x[:m], words, scale, bias, bits=bits, group=group), tall[:m].to(torch.bfloat16)), m
     want = _reference(x[:4], codes, scale.float().cpu(), bias.float().cpu(), group)
     assert torch.allclose(tall[:4].cpu(), want, rtol=2e-3, atol=2e-3)
