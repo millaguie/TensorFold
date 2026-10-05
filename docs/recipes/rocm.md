@@ -54,7 +54,9 @@ rows share the launch.
 ## Decode
 
 A request's one-token decode step is captured as a HIP graph after its first step and replayed, on every rank
-(`TENSORFOLD_GRAPH=0` keeps it eager). Decode attention and RoPE read the position on the device, so a replay gives
+(`TENSORFOLD_GRAPH=0` keeps it eager). On gfx1150 (Radeon 890M) it stays eager by default: a replayed step aborts
+there with a malformed AQL packet unless `DEBUG_CLR_GRAPH_PACKET_CAPTURE=0` is set before HIP starts, and the graph
+decodes no faster on that part; `TENSORFOLD_GRAPH=1` turns it back on. Decode attention and RoPE read the position on the device, so a replay gives
 the eager step's bits.
 
 ## MTP drafting

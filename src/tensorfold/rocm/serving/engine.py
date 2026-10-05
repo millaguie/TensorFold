@@ -168,8 +168,12 @@ class QwenEngine:
         head = getattr(model, "mtp", None)
         self.mtp = MTPEngine(model, head, linear=kernels.linear, rccl=rccl) if head is not None else None
         self.mtp_depth = int(mtp_depth)
-        # One-token steps replay a captured graph; TENSORFOLD_GRAPH=0 keeps them eager.
-        self.graphs = os.environ.get("TENSORFOLD_GRAPH", "1") != "0"
+        # One-token steps replay a captured graph; TENSORFOLD_GRAPH=0 keeps them eager. On gfx1150 (Radeon 890M, ROCm
+        # 7.1-7.2) a replayed step aborts with a malformed AQL packet unless DEBUG_CLR_GRAPH_PACKET_CAPTURE=0 is set
+        # before HIP starts, and the graph decodes no faster there, so that part stays eager unless asked.
+        from tensorfold.rocm.kernels.build import gfx_name
+
+        self.graphs = os.environ.get("TENSORFOLD_GRAPH", "0" if gfx_name() == "gfx1150" else "1") != "0"
         self._step: _StepGraph | None = None
 
     @classmethod
