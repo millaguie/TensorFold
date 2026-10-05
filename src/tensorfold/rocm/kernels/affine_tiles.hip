@@ -143,9 +143,26 @@ __global__ void __launch_bounds__(32 * kRowWaves) affine_dot2_row(Affine a, int 
     const typename T::pair* x = reinterpret_cast<const typename T::pair*>(
         static_cast<const typename T::elem*>(a.x) + x_row(a, 0) * a.k);
     float acc = 0.f;
+    // bf16 tables a whole number of rounds wide: the folding lane loads its column's scales and biases for the round
+    // in 16-byte pieces before the passes, not one by one after the barrier. The fold's arithmetic is unchanged.
+    const bool vec = a.scale.kind == kScaleBF16 && a.bias.kind == kScaleBF16 && lpc >= 8 && groups % lpc == 0;
     for (int g0 = 0; g0 < groups; g0 += lpc) {
         const int g = g0 + j;
         const bool live = g < groups;
+        uint32_t sw[16], bw[16];
+        if (vec && mine < a.n) {
+            const long long at0 = static_cast<long long>(mine) * groups + g0;
+            const uint4* sp = reinterpret_cast<const uint4*>(static_cast<const hip_bfloat16*>(a.scale.p) + at0);
+            const uint4* bp = reinterpret_cast<const uint4*>(static_cast<const hip_bfloat16*>(a.bias.p) + at0);
+#pragma unroll
+            for (int v = 0; v < 4; ++v) {
+                if (v < lpc / 8) {
+                    const uint4 sq = sp[v], bq = bp[v];
+                    sw[4 * v] = sq.x; sw[4 * v + 1] = sq.y; sw[4 * v + 2] = sq.z; sw[4 * v + 3] = sq.w;
+                    bw[4 * v] = bq.x; bw[4 * v + 1] = bq.y; bw[4 * v + 2] = bq.z; bw[4 * v + 3] = bq.w;
+                }
+            }
+        }
         typename T::pair xv[PIECES * 16];
         float sum = 0.f;
 #pragma unroll
@@ -178,7 +195,17 @@ __global__ void __launch_bounds__(32 * kRowWaves) affine_dot2_row(Affine a, int 
             dots[wave][c][j] = dot;
         }
         __syncthreads();
-        if (mine < a.n) {
+        if (mine < a.n && vec) {
+#pragma unroll
+            for (int i = 0; i < 32; ++i) {
+                if (i < lpc) {
+                    const float scale = __uint_as_float(((sw[i >> 1] >> (16 * (i & 1))) & 0xffffu) << 16);
+                    const float bias = __uint_as_float(((bw[i >> 1] >> (16 * (i & 1))) & 0xffffu) << 16);
+                    acc = fmaf(dots[wave][lane][i], scale, acc);
+                    acc = fmaf(sums[wave][i], bias, acc);
+                }
+            }
+        } else if (mine < a.n) {
             const int round = groups - g0 < lpc ? groups - g0 : lpc;
             for (int i = 0; i < round; ++i) {
                 const long long at = static_cast<long long>(mine) * groups + g0 + i;
