@@ -42,11 +42,14 @@ void affine(const at::Tensor& x, const at::Tensor& words, const at::Tensor& scal
                 "scale and bias: (N, K / group), one type");
     const int kind = scale_kind(scale);
     const bool out_half = out.scalar_type() == at::kHalf;
-    TORCH_CHECK(out.is_cuda() && out.is_contiguous() && (out.scalar_type() == at::kFloat || out_half) &&
+    const bool out_bf16 = out.scalar_type() == at::kBFloat16;
+    TORCH_CHECK(out.is_cuda() && out.is_contiguous() && (out.scalar_type() == at::kFloat || out_half || out_bf16) &&
                     out.size(0) == m && out.size(1) == n,
-                "out: (M, N) fp32, or fp16 from the RDNA2 decode tile");
+                "out: (M, N) fp32, or fp16 / bf16 from the decode tile");
     TORCH_CHECK(!out_half || (x.scalar_type() == at::kHalf && m <= 8 && schedule == 0 && split_mode != 2),
                 "fp16 out is the decode tile: fp16 x, M <= 8, the auto schedule, no split");
+    TORCH_CHECK(!out_bf16 || (x.scalar_type() == at::kBFloat16 && m <= 8 && schedule == 0 && split_mode != 2),
+                "bf16 out is the decode tile: bf16 x, M <= 8, the auto schedule, no split");
     c10::cuda::CUDAGuard guard(x.device());
     auto stream = c10::cuda::getCurrentCUDAStream();
     int splits = 1;
@@ -69,7 +72,7 @@ void affine(const at::Tensor& x, const at::Tensor& words, const at::Tensor& scal
     affine_launch(x.data_ptr(), words.data_ptr(), scale.data_ptr(), bias.data_ptr(), kind, out.data_ptr(),
                   static_cast<int>(m), static_cast<int>(n), static_cast<int>(k), static_cast<int>(bits),
                   static_cast<int>(group), static_cast<int>(schedule), x.scalar_type() == at::kHalf ? 1 : 0,
-                  stream.stream(), partial, splits, out_half ? 1 : 0);
+                  stream.stream(), partial, splits, out_half ? 1 : out_bf16 ? 2 : 0);
 }
 
 void affine_pair(const at::Tensor& x, const at::Tensor& words0, const at::Tensor& scale0, const at::Tensor& bias0,

@@ -291,12 +291,18 @@ void affine_launch(const void* x, const void* words, const void* scale, const vo
                    int splits, int out_half) {
     tf::rocm::Affine a{x, static_cast<const uint32_t*>(words), {scale, scale_kind}, {bias, scale_kind},
                        static_cast<float*>(out), m, n, k, bits, group, fp16};
-    if (out_half) {
+    if (out_half == 1) {
         if (!fp16 || schedule != 0 || splits > 1) {
             throw std::runtime_error("affine kernel: fp16 output is the decode tile");
         }
         a.out = nullptr;
         a.out16 = static_cast<__half*>(out);
+    } else if (out_half == 2) {
+        if (fp16 || schedule != 0 || splits > 1 || m > 8) {
+            throw std::runtime_error("affine kernel: bf16 output is the gfx11 / gfx12 decode tile");
+        }
+        a.out = nullptr;
+        a.outb16 = static_cast<hip_bfloat16*>(out);
     }
     hipStream_t hip_stream = static_cast<hipStream_t>(stream);
     hipError_t err = (partial != nullptr && splits > 1)

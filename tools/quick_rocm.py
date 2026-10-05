@@ -29,7 +29,7 @@ def main() -> None:
     ap.add_argument("--lengths", default="2048,8192")
     ap.add_argument("--tokens", type=int, default=128)
     ap.add_argument("--profile", action="store_true", help="print the prefill's top kernels at the last length")
-    ap.add_argument("--profile-decode", action="store_true", help="print a 33-token greedy decode's top kernels")
+    ap.add_argument("--profile-decode", action="store_true", help="print a 97-token greedy decode top kernels")
     a = ap.parse_args()
 
     from tokenizers import Tokenizer
@@ -83,9 +83,9 @@ def main() -> None:
         report(p, f"prefill {lengths[-1]} (unit: the prefill)")
     if a.profile_decode:
         with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as p:
-            eng.generate(ids, 33, None, lambda new: None, stop_eos=False, draft=False)
+            eng.generate(ids, 97, None, lambda new: None, stop_eos=False, draft=False)
             sync()
-        report(p, "decode (unit: one token, the prompt's prefill included)", per=33)
+        report(p, "decode (unit: one token, the prompt prefill spread over 97)", per=97)
 
 
 if __name__ == "__main__":

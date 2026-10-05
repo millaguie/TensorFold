@@ -114,6 +114,8 @@ __global__ void __launch_bounds__(kLaneCols * kLaneWaves) affine_dot2_lanes(Affi
             if (r >= a.m) continue;
             if (a.out16 != nullptr) {
                 a.out16[out_row(a, r) * a.n + col] = __float2half_rn(acc[r]);
+            } else if (a.outb16 != nullptr) {
+                a.outb16[out_row(a, r) * a.n + col] = hip_bfloat16(acc[r]);
             } else {
                 a.out[out_row(a, r) * a.n + col] = acc[r];
             }
@@ -218,6 +220,8 @@ __global__ void __launch_bounds__(32 * kRowWaves) affine_dot2_row(Affine a, int 
     if (mine < a.n) {
         if (a.out16 != nullptr) {
             a.out16[out_row(a, 0) * a.n + mine] = __float2half_rn(acc);
+        } else if (a.outb16 != nullptr) {
+            a.outb16[out_row(a, 0) * a.n + mine] = hip_bfloat16(acc);
         } else {
             a.out[out_row(a, 0) * a.n + mine] = acc;
         }

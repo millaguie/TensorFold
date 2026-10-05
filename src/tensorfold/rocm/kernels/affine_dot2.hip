@@ -538,7 +538,7 @@ hipError_t launch_affine_dot2(const Affine& a, bool reference, hipStream_t strea
     if (a.m <= kLaneRows && (a.group == 32 || a.group == 64 || a.group == 128)) {
         return launch_affine_dot2_lanes(a, stream);
     }
-    if (a.out16 != nullptr) return hipErrorInvalidValue;  // fp16 output is the decode tile's
+    if (a.out16 != nullptr || a.outb16 != nullptr) return hipErrorInvalidValue;  // a 16-bit output is the decode tile's
     if (a.group == 32 || a.group == 64 || a.group == 128) {
         hipError_t lut = ensure_byte_lut(stream);
         if (lut != hipSuccess) return lut;

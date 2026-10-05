@@ -42,6 +42,7 @@ struct Affine {
     int fp16;  // 0 is bf16, 1 is fp16
     Routing route = {};
     __half* out16 = nullptr;  // set: the decode tile rounds each output to fp16 here instead of writing out
+    hip_bfloat16* outb16 = nullptr;  // set: the gfx11 / gfx12 decode tile rounds each output to bf16 here
 };
 
 // Row r of this block's x and out: the plain matrix's r, or the routed item's r-th pair.
