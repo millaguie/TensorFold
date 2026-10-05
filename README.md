@@ -274,19 +274,19 @@ tensorfold serve Qwen3.8-27B-Quark-AWQ-MXFP4 --drafter z-lab/Qwen3.8-27B-DFlash2
 `--ram-tier-gib` keeps the prompt states the GPU cache lets go in pinned host RAM and copies them back when a
 conversation returns, instead of prefilling again; the replies keep their bits either way.
 
-Measured on one R9700 at its stock 300 W power limit on 2026-10-03 (commit `13625f6`) with the command above,
+Measured on one R9700 at its stock 300 W power limit on 2026-10-05 (commit `b641f74`) with the command above,
 thinking off, two server starts (decode on this GPU varies from one process start to the next):
 
 | | TensorFold |
 | --- | --- |
-| Prompt, 6.7K tokens | 2,849-2,859 tok/s |
-| Prompt, 30K tokens | 2,635-2,645 tok/s |
-| Prompt, 67K tokens | 2,119-2,139 tok/s |
-| Decode, chat, one client | 49.0-49.1 tok/s |
-| Decode, code, one client | 125-128 tok/s |
-| One client, total (first token, median) | 70.6-71.1 tok/s (1.0 s) |
-| Two clients, total (first token, median) | 89-99 tok/s (1.9-2.0 s) |
-| Three clients, total (first token, median) | 96-112 tok/s (2.9 s) |
+| Prompt, 6.7K tokens | 2,869-2,879 tok/s |
+| Prompt, 30K tokens | 2,651-2,683 tok/s |
+| Prompt, 67K tokens | 2,138-2,155 tok/s |
+| Decode, chat, one client | 55.9-56.1 tok/s |
+| Decode, code, one client | 144.2-145.1 tok/s |
+| One client, total (first token, median) | 62.8-72.5 tok/s (1.0 s) |
+| Two clients, total (first token, median) | 99.9-115.2 tok/s (1.9-2.1 s) |
+| Three clients, total (first token, median) | 112.9-119.8 tok/s (2.7-2.9 s) |
 
 With `--ram-tier-gib 8`, six 30K-token conversations served in turn take 0.22 s to a repeated turn's first token,
 against 13.2 s without it (the first turn: 12.8 s either way). The kernels credit vLLM-radiance and libr4d for ideas
