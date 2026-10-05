@@ -26,6 +26,7 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--rows", type=int, default=1)
     ap.add_argument("--reps", type=int, default=200)
+    ap.add_argument("--only", default="", help="comma-separated name prefixes to run, e.g. gdn_in,out")
     a = ap.parse_args()
     from tensorfold.rocm.kernels import affine
 
@@ -39,7 +40,10 @@ def main() -> None:
     del warm
     digest = hashlib.sha256()
     total = 0.0
+    only = [p for p in a.only.split(",") if p]
     for name, (n, k) in SHAPES.items():
+        if only and not any(name.startswith(p) for p in only):
+            continue
         words = torch.randint(-2**31, 2**31 - 1, (n, k * 4 // 32), generator=g, device="cuda", dtype=torch.int32)
         scale = (torch.rand(n, k // 64, generator=g, device="cuda") * 0.02).to(torch.bfloat16)
         bias = (torch.rand(n, k // 64, generator=g, device="cuda") * -0.1).to(torch.bfloat16)
