@@ -372,12 +372,16 @@ __device__ inline void stage_block(typename T::elem* xs, typename T::elem* ws, c
     }
 }
 
+// A row's group sum of x (what the bias multiplies) is one thread's: thread r adds row r's 32 values a stage in k order
+// and keeps the running sum to the group's end, the order every tile uses, so the bits are unchanged; the product loop
+// is then dot2s and LDS reads alone, where each of the 16 threads sharing a row used to add the row again.
 template <typename T, int BITS>
 __global__ void __launch_bounds__(256, 1) affine_dot2_block(Affine a) {
     if (!take_item(a, blockIdx.z)) return;
     if (static_cast<int>(blockIdx.y) * kBlockM >= a.m) return;
     __shared__ typename T::elem xs[2][kBlockM * kBlockLd];
     __shared__ typename T::elem ws[2][kBlockN * kBlockLd];
+    __shared__ float rowsum[kBlockM];
     const int tx = threadIdx.x & 15;
     const int ty = threadIdx.x >> 4;
     const int m0 = blockIdx.y * kBlockM;
@@ -388,10 +392,9 @@ __global__ void __launch_bounds__(256, 1) affine_dot2_block(Affine a) {
     const int per = a.group / kBlockK;
     float acc[8][8];
     float dot[8][8];
-    float sumx[8];
+    float run = 0.f;                     // thread r < kBlockM: row r's sum of x since the group began
 #pragma unroll
     for (int i = 0; i < 8; ++i) {
-        sumx[i] = 0.f;
 #pragma unroll
         for (int j = 0; j < 8; ++j) {
             acc[i][j] = 0.f;
@@ -405,6 +408,14 @@ __global__ void __launch_bounds__(256, 1) affine_dot2_block(Affine a) {
         if (s + 1 < stages) stage_block<T, BITS>(xs[cur ^ 1], ws[cur ^ 1], a, m0, n0, (s + 1) * kBlockK, words_row);
         const typename T::elem* xb = xs[cur];
         const typename T::elem* wb = ws[cur];
+        if (static_cast<int>(threadIdx.x) < kBlockM) {
+#pragma unroll
+            for (int t = 0; t < kBlockK; t += 2) {
+                const typename T::pair xp = *reinterpret_cast<const typename T::pair*>(xb + threadIdx.x * kBlockLd + t);
+                run += T::lo(xp);
+                run += T::hi(xp);
+            }
+        }
 #pragma unroll 4
         for (int t = 0; t < kBlockK; t += 2) {
             typename T::pair xv[8];
@@ -421,11 +432,14 @@ __global__ void __launch_bounds__(256, 1) affine_dot2_block(Affine a) {
             for (int i = 0; i < 8; ++i) {
 #pragma unroll
                 for (int j = 0; j < 8; ++j) dot[i][j] = T::dot(xv[i], wv[j], dot[i][j]);
-                sumx[i] += T::lo(xv[i]);
-                sumx[i] += T::hi(xv[i]);
             }
         }
         if (s % per == per - 1) {
+            if (static_cast<int>(threadIdx.x) < kBlockM) {
+                rowsum[threadIdx.x] = run;
+                run = 0.f;
+            }
+            __syncthreads();
             const int g = s / per;
 #pragma unroll
             for (int j = 0; j < 8; ++j) {
@@ -436,12 +450,10 @@ __global__ void __launch_bounds__(256, 1) affine_dot2_block(Affine a) {
 #pragma unroll
                 for (int i = 0; i < 8; ++i) {
                     acc[i][j] = fmaf(dot[i][j], scale, acc[i][j]);
-                    acc[i][j] = fmaf(sumx[i], bias, acc[i][j]);
+                    acc[i][j] = fmaf(rowsum[ty + 16 * i], bias, acc[i][j]);
                     dot[i][j] = 0.f;
                 }
             }
-#pragma unroll
-            for (int i = 0; i < 8; ++i) sumx[i] = 0.f;
         }
         __syncthreads();
     }
