@@ -154,3 +154,25 @@ def test_a_cache_prefix_uses_its_stride():
     got = causal(q, k[:, :, :17], v[:, :, :17], scale, 0)
     ref = _spec(q, k[:, :, :17].contiguous(), v[:, :, :17].contiguous(), scale, 0)
     assert torch.allclose(got, ref, rtol=1e-3, atol=1e-3)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize("heads,kv_heads,dim,span,pos", [(16, 2, 256, 600, 599), (16, 2, 256, 700, 300),
+                                                        (8, 2, 128, 129, 128), (16, 4, 64, 1, 0)])
+def test_gqa_decode_walk_keeps_the_per_head_bits(dtype, heads, kv_heads, dim, span, pos):
+    """The grouped decode walk reads a key/value head once for its query heads; each head keeps the bits of the walk
+    over its own copy of the keys and values (repeated to one key/value head a query head: no group)."""
+
+    from tensorfold.rocm.kernels.attention import causal_at
+
+    g = torch.Generator(device="cuda").manual_seed(span + heads)
+    q = torch.randn(1, heads, 1, dim, generator=g, device="cuda") * 2
+    k = (torch.randn(1, kv_heads, span, dim, generator=g, device="cuda") * 2).to(dtype)
+    v = torch.randn(1, kv_heads, span, dim, generator=g, device="cuda").to(dtype)
+    rep = heads // kv_heads
+    kk = k.repeat_interleave(rep, dim=1).contiguous()
+    vv = v.repeat_interleave(rep, dim=1).contiguous()
+    scale = dim ** -0.5
+    assert torch.equal(causal(q, k, v, scale, pos), causal(q, kk, vv, scale, pos))
+    at = torch.tensor([pos], dtype=torch.int32, device="cuda")
+    assert torch.equal(causal_at(q, k, v, scale, at), causal_at(q, kk, vv, scale, at))

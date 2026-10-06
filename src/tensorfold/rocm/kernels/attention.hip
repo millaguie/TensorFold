@@ -118,6 +118,99 @@ __global__ void score_keys(const float* __restrict__ q, const Cache* __restrict_
     }
 }
 
+// GQA decode: the G query heads that share a key/value head read its keys and values once, not G times. A warp scores
+// one key for all G heads (each head's lane partials and lane sum as score_keys), and a block weighs a 128-key tile of
+// values for all G heads with each weight computed once into LDS (the same expf(score - max) / denom every lane of
+// apply_values computed for itself) and each value row read once. Every head keeps score_keys' and apply_values'
+// arithmetic in the same order: the same bits.
+template <typename Cache, int G>
+__global__ void score_keys_gqa(const float* __restrict__ q, const Cache* __restrict__ k, float* __restrict__ scores,
+                               int span, int heads, int kv_heads, int d, float scale, int visible, long long k_sb,
+                               long long k_sh, long long k_ss, const int* pos) {
+    if (pos != nullptr) visible = min(*pos + 1, span);
+    int lane = threadIdx.x & 31;
+    int key = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    int kv = blockIdx.y;
+    int batch = blockIdx.z;
+    float kreg[8];
+#pragma unroll
+    for (int i = 0; i < 8; ++i) kreg[i] = 0.f;
+    if (key < visible) {
+        const Cache* krow = k + batch * k_sb + static_cast<long long>(kv) * k_sh + static_cast<long long>(key) * k_ss;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            int idx = lane + i * 32;
+            if (idx < d) kreg[i] = static_cast<float>(krow[idx]);
+        }
+    }
+#pragma unroll
+    for (int g = 0; g < G; ++g) {
+        const int head = kv * G + g;
+        const float* qrow = q + (static_cast<long long>(batch) * heads + head) * d;
+        float partial = 0.f;
+        if (key < visible) {
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                int idx = lane + i * 32;
+                if (idx < d) partial += qrow[idx] * kreg[i];
+            }
+        }
+        float dot = tf::rocm::lane0_sum(partial);
+        if (lane == 0 && key < span) {
+            float score = key < visible ? dot * scale : -INFINITY;
+            scores[(static_cast<long long>(batch) * heads + head) * span + key] = score;
+        }
+    }
+}
+
+template <typename Cache, int G>
+__global__ void apply_values_gqa(const float* __restrict__ scores, const float* __restrict__ stats,
+                                 const Cache* __restrict__ v, float* __restrict__ partials, int span, int heads,
+                                 int kv_heads, int d, int visible, long long v_sb, long long v_sh, long long v_ss,
+                                 const int* pos) {
+    if (pos != nullptr) visible = min(*pos + 1, span);
+    __shared__ float weights[G][128];
+    int tile = blockIdx.x;
+    int kv = blockIdx.y;
+    int batch = blockIdx.z;
+    int lane = threadIdx.x;
+    int key0 = tile * 128;
+    int tiles = gridDim.x;
+    if (key0 >= visible) {  // a tile past the keys in use adds zero
+        if (lane < d) {
+            for (int g = 0; g < G; ++g) {
+                partials[(((static_cast<long long>(batch) * heads + kv * G + g) * tiles) + tile) * d + lane] = 0.f;
+            }
+        }
+        return;
+    }
+    int stop = key0 + 128;
+    if (stop > visible) stop = visible;
+    for (int e = threadIdx.x; e < G * 128; e += blockDim.x) {
+        const int g = e >> 7;
+        const int key = key0 + (e & 127);
+        const long long hrow = static_cast<long long>(batch) * heads + kv * G + g;
+        float w = 0.f;
+        if (key < stop) w = expf(scores[hrow * span + key] - stats[hrow * 2]) / stats[hrow * 2 + 1];
+        weights[g][e & 127] = w;
+    }
+    __syncthreads();
+    if (lane >= d) return;
+    const Cache* base = v + batch * v_sb + static_cast<long long>(kv) * v_sh + lane;
+    float acc[G];
+#pragma unroll
+    for (int g = 0; g < G; ++g) acc[g] = 0.f;
+    for (int key = key0; key < stop; ++key) {
+        const float vv = static_cast<float>(base[static_cast<long long>(key) * v_ss]);
+#pragma unroll
+        for (int g = 0; g < G; ++g) acc[g] += weights[g][key - key0] * vv;
+    }
+#pragma unroll
+    for (int g = 0; g < G; ++g) {
+        partials[(((static_cast<long long>(batch) * heads + kv * G + g) * tiles) + tile) * d + lane] = acc[g];
+    }
+}
+
 __global__ void softmax_stats(const float* __restrict__ scores, float* __restrict__ stats, int span, int visible,
                               const int* pos) {
     if (pos != nullptr) visible = min(*pos + 1, span);
@@ -214,8 +307,29 @@ struct Walk {
 };
 
 // Score the keys, reduce the softmax, then stream V, for one cache type.
+template <typename Cache, int G>
+void decode_walk_gqa(const Walk& w) {
+    const dim3 sgrid(w.score_grid.x, w.kv_heads, w.score_grid.z);
+    score_keys_gqa<Cache, G><<<sgrid, w.score_block, 0, w.stream>>>(
+        w.q, static_cast<const Cache*>(w.k), w.scores, w.span, w.heads, w.kv_heads, w.d, w.scale, w.visible, w.k_sb,
+        w.k_sh, w.k_ss, w.pos);
+    softmax_stats<<<w.head_grid, 256, 0, w.stream>>>(w.scores, w.stats, w.span, w.visible, w.pos);
+    const dim3 vgrid(w.tile_grid.x, w.kv_heads, w.tile_grid.z);
+    apply_values_gqa<Cache, G><<<vgrid, 256, 0, w.stream>>>(
+        w.scores, w.stats, static_cast<const Cache*>(w.v), w.partials, w.span, w.heads, w.kv_heads, w.d, w.visible,
+        w.v_sb, w.v_sh, w.v_ss, w.pos);
+}
+
 template <typename Cache>
 void decode_walk(const Walk& w) {
+    if (w.d <= 256 && w.heads % w.kv_heads == 0) {
+        switch (w.heads / w.kv_heads) {
+            case 2: decode_walk_gqa<Cache, 2>(w); return;
+            case 4: decode_walk_gqa<Cache, 4>(w); return;
+            case 8: decode_walk_gqa<Cache, 8>(w); return;
+            default: break;
+        }
+    }
     score_keys<Cache><<<w.score_grid, w.score_block, 0, w.stream>>>(
         w.q, static_cast<const Cache*>(w.k), w.scores, w.span, w.heads, w.kv_heads, w.d, w.scale, w.visible, w.k_sb,
         w.k_sh, w.k_ss, w.pos);
