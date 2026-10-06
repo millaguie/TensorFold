@@ -90,9 +90,13 @@ struct DotBF16 {
     __device__ static pair two(elem a, elem b) { return pair{a, b}; }
     __device__ static float lo(pair p) { return static_cast<float>(p.x); }
     __device__ static float hi(pair p) { return static_cast<float>(p.y); }
+    // A code is an integer below 256, exact in BF16: the rounding cast is the float's top half, which gfx11 takes
+    // with a shift where the cast itself is a software round to nearest even.
     template <int BITS>
     __device__ static elem code(const uint32_t (&w)[BITS], int t) {
-        return static_cast<__bf16>(static_cast<float>(piece_bits<BITS>(w, t)));
+        static_assert(BITS <= 8, "codes up to 8 bits are exact in BF16");
+        const float f = static_cast<float>(piece_bits<BITS>(w, t));
+        return __builtin_bit_cast(__bf16, static_cast<unsigned short>(__float_as_uint(f) >> 16));
     }
     __device__ static float dot(pair x, pair q, float acc) {
 #if TF_DEVICE_BF16_DOT2
