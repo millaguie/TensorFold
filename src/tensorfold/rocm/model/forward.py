@@ -56,12 +56,14 @@ def _project_group(x: torch.Tensor, packeds: tuple, linear):
                  for y in outs)
 
 
-def _residual(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-    """``x + y``; a ranks' fp32 sum is added to a widened residual and rounded once."""
+def _add_residual(x: torch.Tensor, y: torch.Tensor) -> None:
+    """``x += y`` in place; a rank's fp32 sum is added to a widened residual and rounded once. In place is one add
+    kernel where ``x[...] = x + y`` added and then copied back, with the same rounding."""
 
     if y.dtype == torch.float32 and x.dtype != torch.float32:
-        return x.float() + y
-    return x + y
+        x.copy_(x.float() + y)
+    else:
+        x.add_(y)
 
 
 def forward_hidden(model, tokens: torch.Tensor, caches: list | None, linear, pos0: int,
@@ -90,11 +92,11 @@ def forward_hidden(model, tokens: torch.Tensor, caches: list | None, linear, pos
                 y, cache = _linear_attn(spec, layer, normed, cache, linear, exact_short, at is not None)
             if reduce is not None:
                 y = reduce(y)
-            x[:, start:stop] = _residual(x[:, start:stop], y)
+            _add_residual(x[:, start:stop], y)
             y = _mlp(spec, layer, rms_norm(x[:, start:stop], layer.post_norm, spec.eps), linear)
             if reduce is not None:
                 y = reduce(y)
-            x[:, start:stop] = _residual(x[:, start:stop], y)
+            _add_residual(x[:, start:stop], y)
         new_caches.append(cache)
     return rms_norm(x, model.final_norm, spec.eps), new_caches
 
