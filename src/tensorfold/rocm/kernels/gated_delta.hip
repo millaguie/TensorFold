@@ -1,6 +1,7 @@
 // Gated DeltaNet: a wave per (batch, value head, value row) walks the sequence, lane sums as the Python reference.
 
 #include "gated_delta.hpp"
+#include "wave.hpp"
 
 #include <hip/hip_runtime.h>
 
@@ -10,28 +11,8 @@
 namespace tf {
 namespace rocm {
 
-// x from lane (lane ^ M) of a full wave32, on the VALU: v_permlanex16 swaps the two rows of 16, DPP row_xmask the
-// rest. __shfl_xor is a ds_bpermute through LDS, about twelve of them on each step's critical path.
-template <int M>
-__device__ inline float swap_xor(float x) {
-    const int bits = __builtin_bit_cast(int, x);
-    if constexpr (M == 16) {
-        return __builtin_bit_cast(float, __builtin_amdgcn_permlanex16(bits, bits, 0x76543210, 0xfedcba98, false, false));
-    } else {
-        return __builtin_bit_cast(float, __builtin_amdgcn_mov_dpp(bits, 0x160 + M, 0xf, 0xf, false));
-    }
-}
-
-// The xor tree (16, 8, 4, 2, 1), then lane 0's total to every lane: the same adds as the __shfl_xor loop, so the same
-// bits. Every lane of the wave has to be active.
-__device__ float lane0_sum(float x) {
-    x += swap_xor<16>(x);
-    x += swap_xor<8>(x);
-    x += swap_xor<4>(x);
-    x += swap_xor<2>(x);
-    x += swap_xor<1>(x);
-    return __builtin_bit_cast(float, __builtin_amdgcn_readfirstlane(__builtin_bit_cast(int, x)));
-}
+// Every lane of a wave enters each sum.
+__device__ inline float lane0_sum(float x) { return wave_lane0_sum(x); }
 
 template <int DK>
 __global__ void __launch_bounds__(32)

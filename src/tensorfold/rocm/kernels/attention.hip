@@ -10,15 +10,13 @@
 #include <string>
 
 #include "attention_fa.hip"
+#include "wave.hpp"
 
 namespace tf {
 namespace rocm {
 
-__device__ float lane0_sum(float x) {
-#pragma unroll
-    for (int mask = 16; mask > 0; mask >>= 1) x += __shfl_xor(x, mask, 32);
-    return __shfl(x, 0, 32);
-}
+// Every caller's wave is whole: the key and query loops are uniform across it.
+__device__ inline float lane0_sum(float x) { return wave_lane0_sum(x); }
 
 template <typename Cache>
 __device__ float row_dot(const float* qreg, const Cache* row, int d, int lane) {

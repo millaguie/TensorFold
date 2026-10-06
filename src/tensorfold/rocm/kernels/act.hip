@@ -1,4 +1,5 @@
 #include "act.hpp"
+#include "wave.hpp"
 
 #include <hip/hip_bfloat16.h>
 #include <hip/hip_fp16.h>
@@ -10,11 +11,8 @@
 namespace tf {
 namespace rocm {
 
-__device__ float warp_sum(float x) {
-#pragma unroll
-    for (int mask = 16; mask > 0; mask >>= 1) x += __shfl_xor(x, mask, 32);
-    return __shfl(x, 0, 32);
-}
+// Callers return or branch a whole wave at a time, so every lane enters.
+__device__ inline float warp_sum(float x) { return wave_lane0_sum(x); }
 
 __device__ inline float widen(float v) { return v; }
 __device__ inline float widen(__half v) { return __half2float(v); }
