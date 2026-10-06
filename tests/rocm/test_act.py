@@ -162,3 +162,19 @@ def test_rms_in_the_activation_dtype_matches_fp32_then_cast():
         x = torch.randn(3, 5120, generator=g, device="cuda").to(dtype)
         assert torch.equal(rms(x, weight, 1e-6), rms(x.float(), weight, 1e-6).to(dtype))
         assert torch.equal(rms(x, None, 1e-6), rms(x.float(), None, 1e-6).to(dtype))
+
+
+@pytest.mark.parametrize("width", [128, 100, 256, 512])
+def test_gated_norm_keeps_the_torch_ops_bits(width):
+    """rms_norm(y) * silu(z) in one kernel: the norm's, silu's, the multiply's and the cast's roundings."""
+
+    from tensorfold.rocm.model.forward import _gated_norm
+
+    g = torch.Generator(device="cuda").manual_seed(width)
+    y = torch.randn(3, 5, 32, width, generator=g, device="cuda") * 3
+    z = (torch.randn(3, 5, 32, width, generator=g, device="cuda") * 6).to(torch.bfloat16)
+    weight = torch.randn(width, generator=g, device="cuda")
+    want = (rms_norm(y, weight, 1e-6) * torch.nn.functional.silu(z).float()).to(torch.bfloat16)
+    got = _gated_norm(y, z, weight, 1e-6, torch.bfloat16)
+    assert got.dtype == torch.bfloat16 and got.shape == z.shape
+    assert torch.equal(got.view(torch.int16), want.view(torch.int16))

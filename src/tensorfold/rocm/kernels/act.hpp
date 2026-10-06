@@ -7,7 +7,11 @@
 // kind: 0 fp32, 1 fp16, 2 bf16 for x and y. weight is fp32. The arithmetic is fp32.
 void rms_launch(const void* x, const float* weight, void* y, int kind, int rows, int width, float eps,
                 hipStream_t stream);
-void conv_decode_launch(const float* x, const float* weight, float* state, float* y, int batch, int channels,
+// rms_norm(y fp32, weight) * silu(z bf16), rounded to bf16 as torch would, rows up to 512 wide; false past that.
+bool gated_rms_launch(const float* y, const float* weight, const void* z, void* out, int rows, int width, float eps,
+                      hipStream_t stream);
+// x kind 0 fp32, 2 bf16.
+void conv_decode_launch(const void* x, int kind, const float* weight, float* state, float* y, int batch, int channels,
                         int kernel, hipStream_t stream);
 // A prompt's conv and silu; x kind 0 fp32, 1 fp16, 2 bf16; state (batch, kernel - 1, channels) fp32 is read only.
 void conv_prefill_launch(const void* x, int kind, const float* weight, const float* state, float* y, int batch,

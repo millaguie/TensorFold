@@ -38,9 +38,32 @@ void rms(const at::Tensor& x, const at::Tensor& weight, at::Tensor& y, double ep
                static_cast<float>(eps), stream.stream());
 }
 
+bool gated_rms(const at::Tensor& y, const at::Tensor& weight, const at::Tensor& z, at::Tensor& out, double eps) {
+    TORCH_CHECK(y.is_cuda() && y.is_contiguous() && y.scalar_type() == at::kFloat && y.dim() == 2, "y: (rows, d) fp32");
+    TORCH_CHECK(z.is_cuda() && z.is_contiguous() && z.scalar_type() == at::kBFloat16 && z.sizes() == y.sizes(),
+                "z: (rows, d) bf16");
+    TORCH_CHECK(out.is_cuda() && out.is_contiguous() && out.scalar_type() == at::kBFloat16 && out.sizes() == y.sizes(),
+                "out: (rows, d) bf16");
+    const float* wptr = nullptr;
+    if (weight.numel() > 0) {
+        TORCH_CHECK(weight.is_cuda() && weight.is_contiguous() && weight.scalar_type() == at::kFloat &&
+                        weight.numel() == y.size(1),
+                    "weight: (d,) fp32");
+        wptr = weight.data_ptr<float>();
+    }
+    c10::cuda::CUDAGuard guard(y.device());
+    auto stream = c10::cuda::getCurrentCUDAStream();
+    for (const at::Tensor& tensor : {y, z, out}) keep(tensor, stream);
+    if (wptr != nullptr) keep(weight, stream);
+    return gated_rms_launch(y.data_ptr<float>(), wptr, z.data_ptr(), out.data_ptr(), static_cast<int>(y.size(0)),
+                            static_cast<int>(y.size(1)), static_cast<float>(eps), stream.stream());
+}
+
 void conv_decode(const at::Tensor& x, const at::Tensor& weight, at::Tensor& state, at::Tensor& y) {
-    TORCH_CHECK(x.is_cuda() && x.is_contiguous() && x.scalar_type() == at::kFloat && x.dim() == 3 && x.size(1) == 1,
-                "x: (batch, 1, channels) fp32");
+    TORCH_CHECK(x.is_cuda() && x.is_contiguous() &&
+                    (x.scalar_type() == at::kFloat || x.scalar_type() == at::kBFloat16) && x.dim() == 3 &&
+                    x.size(1) == 1,
+                "x: (batch, 1, channels) fp32 or bf16");
     const int64_t batch = x.size(0), channels = x.size(2);
     TORCH_CHECK(weight.is_cuda() && weight.is_contiguous() && weight.scalar_type() == at::kFloat && weight.dim() == 2 &&
                     weight.size(0) == channels && weight.size(1) >= 1 && weight.size(1) <= 8,
@@ -53,7 +76,7 @@ void conv_decode(const at::Tensor& x, const at::Tensor& weight, at::Tensor& stat
     c10::cuda::CUDAGuard guard(x.device());
     auto stream = c10::cuda::getCurrentCUDAStream();
     for (const at::Tensor& tensor : {x, weight, state, y}) keep(tensor, stream);
-    conv_decode_launch(x.data_ptr<float>(), weight.data_ptr<float>(), state.data_ptr<float>(), y.data_ptr<float>(),
+    conv_decode_launch(x.data_ptr(), x.scalar_type() == at::kBFloat16 ? 2 : 0, weight.data_ptr<float>(), state.data_ptr<float>(), y.data_ptr<float>(),
                        static_cast<int>(batch), static_cast<int>(channels), static_cast<int>(kernel), stream.stream());
 }
 
@@ -226,6 +249,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("moe_act", &moe_act);
     m.def("moe_combine", &moe_combine);
     m.def("rms", &rms);
+    m.def("gated_rms", &gated_rms);
     m.def("conv_decode", &conv_decode);
     m.def("conv_prefill", &conv_prefill);
     m.def("rope_decode", &rope_decode);

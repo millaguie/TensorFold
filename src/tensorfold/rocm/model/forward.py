@@ -136,6 +136,23 @@ def _moe_mlp(routed, x: torch.Tensor) -> torch.Tensor:
     return y.view(batch, length, hidden).to(dtype=x.dtype)
 
 
+def _gated_norm(y: torch.Tensor, z: torch.Tensor, weight: torch.Tensor, eps: float, dtype: torch.dtype) -> torch.Tensor:
+    """``rms_norm(y) * silu(z)`` in ``dtype``; on the device one kernel with these ops' roundings."""
+
+    width = y.shape[-1]
+    if (y.is_cuda and y.dtype == torch.float32 and z.dtype == torch.bfloat16 and dtype == torch.bfloat16
+            and width <= 512 and weight is not None and weight.numel() == width):
+        from tensorfold.rocm.kernels.act import gated_rms
+
+        out = gated_rms(y.reshape(-1, width).contiguous(), weight.reshape(width).float().contiguous(),
+                        z.reshape(-1, width).contiguous(), eps)
+        if out is not None:
+            return out.view(z.shape)
+    # silu(z) widened first: the same product as the promoting multiply, on the same-dtype kernel.
+    y = rms_norm(y, weight, eps) * torch.nn.functional.silu(z).float()
+    return y if y.dtype == dtype else y.to(dtype=dtype)
+
+
 def _linear_span(spec: Spec, layer, x: torch.Tensor, conv_state, rec, linear, exact: bool, in_place: bool = False):
     batch, length, _ = x.shape
     grouped = _project_group(x, (layer.qkv, layer.z, layer.a, layer.b), linear)
@@ -154,10 +171,7 @@ def _linear_span(spec: Spec, layer, x: torch.Tensor, conv_state, rec, linear, ex
     v = v.view(batch, length, spec.value_heads, spec.value_dim)
     q, k = normalize_qk(q, k, spec.key_dim, spec.eps)
     y, rec = gated_delta(q, k, v, a, b, layer.a_log, layer.dt_bias, rec, fused=not exact and length == 1)
-    # silu(z) widened first: the same product as the promoting multiply, on the same-dtype kernel.
-    y = rms_norm(y, layer.gnorm, spec.eps) * torch.nn.functional.silu(z).float()
-    if y.dtype != x.dtype:
-        y = y.to(dtype=x.dtype)
+    y = _gated_norm(y, z, layer.gnorm, spec.eps, x.dtype)
     return _project(y.reshape(batch, length, -1), layer.out, linear), conv_state, rec
 
 

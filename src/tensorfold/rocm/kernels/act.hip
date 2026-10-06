@@ -85,6 +85,51 @@ __global__ void __launch_bounds__(32 * kRmsRowsWaves) rms_rows_kernel(const T* _
     }
 }
 
+// torch's float to bf16 cast: round to nearest even, every NaN to 0x7FC0.
+__device__ inline hip_bfloat16 torch_bf16(float v) {
+    hip_bfloat16 out(v);
+    if (v != v) out.data = 0x7FC0;
+    return out;
+}
+
+// The gated output norm of the linear attention, rms_norm(y, weight) * silu(z) rounded to bf16, in one pass with
+// torch's arithmetic: the norm is rms_rows_kernel's, silu(z) is computed in fp32 as x / (1 + exp(-x)) and rounded to
+// bf16 (torch's bf16 silu), widened back, multiplied in fp32 and the product rounded once. Five launches were one
+// each: the norm, the silu, the widening, the multiply and the cast.
+template <int PER>
+__global__ void __launch_bounds__(32 * kRmsRowsWaves) gated_rms_rows_kernel(const float* __restrict__ y,
+                                                                            const float* __restrict__ weight,
+                                                                            const hip_bfloat16* __restrict__ z,
+                                                                            hip_bfloat16* __restrict__ out, int rows,
+                                                                            int width, float eps) {
+    const int lane = threadIdx.x & 31;
+    const int row = blockIdx.x * kRmsRowsWaves + (threadIdx.x >> 5);
+    if (row >= rows) return;
+    const float* in = y + static_cast<long long>(row) * width;
+    float v[PER];
+    float sum = 0.f;
+#pragma unroll
+    for (int i = 0; i < PER; ++i) {
+        const int at = lane + 32 * i;
+        v[i] = at < width ? in[at] : 0.f;
+        if (at < width) sum += v[i] * v[i];
+    }
+    const float inv = rsqrtf(warp_sum(sum) / static_cast<float>(width) + eps);
+    const hip_bfloat16* zr = z + static_cast<long long>(row) * width;
+    hip_bfloat16* o = out + static_cast<long long>(row) * width;
+#pragma unroll
+    for (int i = 0; i < PER; ++i) {
+        const int at = lane + 32 * i;
+        if (at < width) {
+            float value = v[i] * inv;
+            if (weight != nullptr) value *= weight[at];
+            const float zf = static_cast<float>(zr[at]);
+            const float gate = static_cast<float>(torch_bf16(zf / (1.f + expf(-zf))));
+            o[at] = torch_bf16(value * gate);
+        }
+    }
+}
+
 template <typename T>
 bool rms_rows_launch(const T* x, const float* weight, T* y, int rows, int width, float eps, hipStream_t stream) {
     const dim3 grid((rows + kRmsRowsWaves - 1) / kRmsRowsWaves);
@@ -102,7 +147,9 @@ bool rms_rows_launch(const T* x, const float* weight, T* y, int rows, int width,
 }
 
 // Length 1. Taps run in order, then the state shifts toward the new sample.
-__global__ void conv_decode_kernel(const float* __restrict__ x, const float* __restrict__ weight,
+// x fp32 or bf16 (widened exactly as it is read: the .float() copy it replaces).
+template <typename T>
+__global__ void conv_decode_kernel(const T* __restrict__ x, const float* __restrict__ weight,
                                    float* __restrict__ state, float* __restrict__ y, int channels, int kernel) {
     int channel = blockIdx.x * blockDim.x + threadIdx.x;
     int batch = blockIdx.y;
@@ -115,7 +162,7 @@ __global__ void conv_decode_kernel(const float* __restrict__ x, const float* __r
         history[tap] = state[(static_cast<long long>(batch) * kept + tap) * channels + channel];
         acc += history[tap] * row[tap];
     }
-    float sample = x[static_cast<long long>(batch) * channels + channel];
+    float sample = widen(x[static_cast<long long>(batch) * channels + channel]);
     acc += sample * row[kept];
     float gate = 1.f / (1.f + expf(-acc));
     y[(static_cast<long long>(batch) * channels) + channel] = acc * gate;
@@ -348,11 +395,37 @@ void rms_launch(const void* x, const float* weight, void* y, int kind, int rows,
     if (err != hipSuccess) throw std::runtime_error(std::string("rms kernel: ") + hipGetErrorString(err));
 }
 
-void conv_decode_launch(const float* x, const float* weight, float* state, float* y, int batch, int channels,
+bool gated_rms_launch(const float* y, const float* weight, const void* z, void* out, int rows, int width, float eps,
+                      hipStream_t stream) {
+    const dim3 grid((rows + tf::rocm::kRmsRowsWaves - 1) / tf::rocm::kRmsRowsWaves);
+    const dim3 block(32 * tf::rocm::kRmsRowsWaves);
+    const hip_bfloat16* zb = static_cast<const hip_bfloat16*>(z);
+    hip_bfloat16* ob = static_cast<hip_bfloat16*>(out);
+    if (width <= 128) {
+        tf::rocm::gated_rms_rows_kernel<4><<<grid, block, 0, stream>>>(y, weight, zb, ob, rows, width, eps);
+    } else if (width <= 256) {
+        tf::rocm::gated_rms_rows_kernel<8><<<grid, block, 0, stream>>>(y, weight, zb, ob, rows, width, eps);
+    } else if (width <= 512) {
+        tf::rocm::gated_rms_rows_kernel<16><<<grid, block, 0, stream>>>(y, weight, zb, ob, rows, width, eps);
+    } else {
+        return false;
+    }
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess) throw std::runtime_error(std::string("gated rms kernel: ") + hipGetErrorString(err));
+    return true;
+}
+
+void conv_decode_launch(const void* x, int kind, const float* weight, float* state, float* y, int batch, int channels,
                         int kernel, hipStream_t stream) {
     dim3 block(128);
     dim3 grid((channels + 127) / 128, batch);
-    tf::rocm::conv_decode_kernel<<<grid, block, 0, stream>>>(x, weight, state, y, channels, kernel);
+    if (kind == 2) {
+        tf::rocm::conv_decode_kernel<<<grid, block, 0, stream>>>(static_cast<const hip_bfloat16*>(x), weight, state, y,
+                                                                  channels, kernel);
+    } else {
+        tf::rocm::conv_decode_kernel<<<grid, block, 0, stream>>>(static_cast<const float*>(x), weight, state, y,
+                                                                  channels, kernel);
+    }
     hipError_t err = hipGetLastError();
     if (err != hipSuccess) throw std::runtime_error(std::string("conv kernel: ") + hipGetErrorString(err));
 }

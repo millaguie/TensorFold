@@ -232,7 +232,8 @@ def causal_conv(x: torch.Tensor, weight: torch.Tensor, state: torch.Tensor | Non
             state = torch.zeros(batch, kernel - 1, channels, device=x.device, dtype=torch.float32)
         else:
             state = state.to(dtype=torch.float32).contiguous()
-        sample = x.reshape(batch, 1, channels).float().contiguous()
+        sample = x.reshape(batch, 1, channels)
+        sample = (sample if sample.dtype == torch.bfloat16 else sample.float()).contiguous()   # the kernel widens bf16
         y = conv_decode(sample, weight.float().contiguous(), state)
         return y.view(batch, 1, channels), state
     if state is None:

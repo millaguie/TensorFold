@@ -26,10 +26,18 @@ def rms(x: torch.Tensor, weight: torch.Tensor | None, eps: float) -> torch.Tenso
     return y
 
 
+def gated_rms(y: torch.Tensor, weight: torch.Tensor | None, z: torch.Tensor, eps: float) -> torch.Tensor | None:
+    """``rms(y, weight) * silu(z)`` as bf16, torch's roundings; ``y`` (rows, d) fp32, ``z`` bf16. None past d 512."""
+
+    out = torch.empty(z.shape, dtype=torch.bfloat16, device=z.device)
+    w = weight if weight is not None else torch.empty(0, device=y.device)
+    return out if _ext().gated_rms(y, w, z, out, float(eps)) else None
+
+
 def conv_decode(x: torch.Tensor, weight: torch.Tensor, state: torch.Tensor) -> torch.Tensor:
     """Length-1 depthwise conv. ``state`` is updated in place."""
 
-    y = torch.empty_like(x)
+    y = torch.empty(x.shape, dtype=torch.float32, device=x.device)
     _ext().conv_decode(x, weight, state, y)
     return y
 
