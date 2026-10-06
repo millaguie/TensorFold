@@ -96,7 +96,12 @@ class Routed:
     rows32: torch.Tensor = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
-        self.rows32 = self.router.float().contiguous()      # widened once: bf16 widens exactly
+        # The router kernel reads a bf16 router as stored (it widens exactly) at the widths it tiles; others widen
+        # once here. Same fp32 values either way.
+        if self.router.dtype == torch.bfloat16 and self.router.shape[1] in (1024, 2048, 4096):
+            self.rows32 = self.router.contiguous()
+        else:
+            self.rows32 = self.router.float().contiguous()
 
     @property
     def count(self) -> int:

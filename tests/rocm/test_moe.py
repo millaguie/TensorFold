@@ -510,3 +510,20 @@ def test_a_routed_row_has_its_bits_alone_or_among_others(bits, group):
                          for p in parts])
     want = torch.einsum("pk,pnk->pn", x.double().cpu().repeat_interleave(slots, 0), dense[flat])
     assert torch.allclose(whole.double().cpu(), want, rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.parametrize("width", [1024, 2048, 4096])
+@pytest.mark.parametrize("rows", [1, 2, 33])
+def test_router_reads_a_bf16_router_as_its_widened_copy(width, rows):
+    """A bf16 router read as stored gives the logits of its fp32 widening, bit for bit."""
+
+    from tensorfold.rocm.kernels import act
+
+    gen = torch.Generator(device="cuda").manual_seed(width + rows)
+    x = torch.randn((rows, width), generator=gen, device="cuda").to(torch.bfloat16)
+    router = torch.randn((257, width), generator=gen, device="cuda").to(torch.bfloat16)
+    want = torch.empty((rows, 257), device="cuda")
+    got = torch.empty_like(want)
+    act.moe_router(x, router.float().contiguous(), want)
+    act.moe_router(x, router, got)
+    assert torch.equal(got, want)

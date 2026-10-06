@@ -116,15 +116,23 @@ void moe_router(const at::Tensor& x, const at::Tensor& rows, at::Tensor& logits)
     TORCH_CHECK(x.is_cuda() && x.is_contiguous() && x.dim() == 2 &&
                     (x.scalar_type() == at::kHalf || x.scalar_type() == at::kBFloat16),
                 "x: (R, D) fp16 or bf16");
-    TORCH_CHECK(rows.is_cuda() && rows.is_contiguous() && rows.scalar_type() == at::kFloat && rows.dim() == 2 &&
+    TORCH_CHECK(rows.is_cuda() && rows.is_contiguous() &&
+                    (rows.scalar_type() == at::kFloat || rows.scalar_type() == at::kBFloat16) && rows.dim() == 2 &&
                     rows.size(1) == x.size(1),
-                "rows: (E + 1, D) fp32");
+                "rows: (E + 1, D) fp32, or bf16 for D of 1024, 2048 or 4096");
     TORCH_CHECK(logits.is_cuda() && logits.is_contiguous() && logits.scalar_type() == at::kFloat &&
                     logits.size(0) == x.size(0) && logits.size(1) == rows.size(0),
                 "logits: (R, E + 1) fp32");
     c10::cuda::CUDAGuard guard(x.device());
     auto stream = c10::cuda::getCurrentCUDAStream();
     for (const at::Tensor& tensor : {x, rows, logits}) keep(tensor, stream);
+    if (rows.scalar_type() == at::kBFloat16) {
+        TORCH_CHECK(moe_router_bf16_launch(x.data_ptr(), act_kind(x), rows.data_ptr(), logits.data_ptr<float>(),
+                                           static_cast<int>(x.size(0)), static_cast<int>(x.size(1)),
+                                           static_cast<int>(rows.size(0)), stream.stream()),
+                    "bf16 router rows want D of 1024, 2048 or 4096");
+        return;
+    }
     moe_router_launch(x.data_ptr(), act_kind(x), rows.data_ptr<float>(), logits.data_ptr<float>(),
                       static_cast<int>(x.size(0)), static_cast<int>(x.size(1)), static_cast<int>(rows.size(0)),
                       stream.stream());

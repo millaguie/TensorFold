@@ -17,6 +17,9 @@ void rope_decode_launch(const float* x, float* y, int rows, int width, int rotar
                         hipStream_t stream, const int* pos_dev = nullptr);
 
 // Router logits in fp32 by one wave a logit (fixed order), so a row's bits do not depend on R. x kind 1 fp16, 2 bf16.
+// The same logits from the router as stored in bf16, for D of 1024, 2048 or 4096; false for another D.
+bool moe_router_bf16_launch(const void* x, int kind, const void* rows, float* logits, int r, int d, int e,
+                            hipStream_t stream);
 void moe_router_launch(const void* x, int kind, const float* rows, float* logits, int r, int d, int e,
                        hipStream_t stream);
 // The CUDA pick rule per row; with items set (one row) it also writes the plan: item k = (pick_k, k, 1).

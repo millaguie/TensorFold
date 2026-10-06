@@ -190,16 +190,18 @@ __global__ void __launch_bounds__(256) moe_router_kernel(const T* __restrict__ x
 // and a decode step issues the row's loads up front.
 constexpr int kRouterTile = 32;
 
-template <typename T, int PER>
-__global__ void __launch_bounds__(256) moe_router_rows(const T* __restrict__ x, const float* __restrict__ rows,
+// W is the router's stored type: a bf16 row widens exactly, so reading it as stored halves the bytes and keeps the
+// fp32 values (and bits) of a widened copy.
+template <typename T, typename W, int PER>
+__global__ void __launch_bounds__(256) moe_router_rows(const T* __restrict__ x, const W* __restrict__ rows,
                                                        float* __restrict__ logits, int d, int e, int r) {
     const int lane = threadIdx.x & 31;
     const int expert = blockIdx.x * 8 + (threadIdx.x >> 5);
     if (expert >= e) return;
-    const float* w = rows + static_cast<long long>(expert) * d;
+    const W* w = rows + static_cast<long long>(expert) * d;
     float wr[PER];
 #pragma unroll
-    for (int j = 0; j < PER; ++j) wr[j] = w[lane + 32 * j];
+    for (int j = 0; j < PER; ++j) wr[j] = widen(w[lane + 32 * j]);
     const int r0 = blockIdx.y * kRouterTile;
     const int r1 = r0 + kRouterTile < r ? r0 + kRouterTile : r;
     for (int row = r0; row < r1; ++row) {
@@ -380,23 +382,24 @@ void rope_decode_launch(const float* x, float* y, int rows, int width, int rotar
     if (err != hipSuccess) throw std::runtime_error(std::string("rope kernel: ") + hipGetErrorString(err));
 }
 
-template <typename T>
-static bool router_rows_launch(const void* x, const float* rows, float* logits, int r, int d, int e,
+template <typename T, typename W>
+static bool router_rows_launch(const void* x, const W* rows, float* logits, int r, int d, int e,
                                hipStream_t stream) {
     const dim3 grid((e + 7) / 8, (r + tf::rocm::kRouterTile - 1) / tf::rocm::kRouterTile);
     const T* xt = static_cast<const T*>(x);
     switch (d) {
-        case 1024: tf::rocm::moe_router_rows<T, 32><<<grid, 256, 0, stream>>>(xt, rows, logits, d, e, r); return true;
-        case 2048: tf::rocm::moe_router_rows<T, 64><<<grid, 256, 0, stream>>>(xt, rows, logits, d, e, r); return true;
-        case 4096: tf::rocm::moe_router_rows<T, 128><<<grid, 256, 0, stream>>>(xt, rows, logits, d, e, r); return true;
+        case 1024: tf::rocm::moe_router_rows<T, W, 32><<<grid, 256, 0, stream>>>(xt, rows, logits, d, e, r); return true;
+        case 2048: tf::rocm::moe_router_rows<T, W, 64><<<grid, 256, 0, stream>>>(xt, rows, logits, d, e, r); return true;
+        case 4096: tf::rocm::moe_router_rows<T, W, 128><<<grid, 256, 0, stream>>>(xt, rows, logits, d, e, r);
+            return true;
         default: return false;
     }
 }
 
 void moe_router_launch(const void* x, int kind, const float* rows, float* logits, int r, int d, int e,
                        hipStream_t stream) {
-    if (kind == 1 ? router_rows_launch<__half>(x, rows, logits, r, d, e, stream)
-                  : router_rows_launch<hip_bfloat16>(x, rows, logits, r, d, e, stream)) {
+    if (kind == 1 ? router_rows_launch<__half, float>(x, rows, logits, r, d, e, stream)
+                  : router_rows_launch<hip_bfloat16, float>(x, rows, logits, r, d, e, stream)) {
         hipError_t err = hipGetLastError();
         if (err != hipSuccess) throw std::runtime_error(std::string("moe router kernel: ") + hipGetErrorString(err));
         return;
@@ -411,6 +414,18 @@ void moe_router_launch(const void* x, int kind, const float* rows, float* logits
     }
     hipError_t err = hipGetLastError();
     if (err != hipSuccess) throw std::runtime_error(std::string("moe router kernel: ") + hipGetErrorString(err));
+}
+
+bool moe_router_bf16_launch(const void* x, int kind, const void* rows, float* logits, int r, int d, int e,
+                            hipStream_t stream) {
+    const hip_bfloat16* w = static_cast<const hip_bfloat16*>(rows);
+    if (!(kind == 1 ? router_rows_launch<__half, hip_bfloat16>(x, w, logits, r, d, e, stream)
+                    : router_rows_launch<hip_bfloat16, hip_bfloat16>(x, w, logits, r, d, e, stream))) {
+        return false;
+    }
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess) throw std::runtime_error(std::string("moe router kernel: ") + hipGetErrorString(err));
+    return true;
 }
 
 void moe_select_launch(const float* logits, int* pick, float* wts, int* items, int* members, int capacity, int r,
