@@ -76,6 +76,31 @@ def test_decode_conv_matches_the_loop():
     assert torch.allclose(new_state, window[:, 1:].contiguous(), rtol=1e-5, atol=1e-5)
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("width", [1, 37, 128, 256, 300, 512])
+def test_short_rows_keep_the_block_kernels_bits(dtype, width):
+    """Rows up to 512 wide take one wave a row with the block kernel's lane-order sum, recomputed here up to the last
+    bit of torch's rsqrt; a row's bits do not depend on how many rows share the launch."""
+
+    g = torch.Generator(device="cuda").manual_seed(8)
+    x = (torch.randn(70, width, generator=g, device="cuda") * 4).to(dtype)
+    weight = torch.randn(width, generator=g, device="cuda")
+    got = rms_norm(x, weight, 1e-6)
+    v = x.float()
+    lanes = torch.zeros(70, 32, device="cuda")
+    for start in range(0, width, 32):
+        part = v[:, start:start + 32]
+        lanes[:, :part.shape[1]] += part * part
+    for mask in (16, 8, 4, 2, 1):
+        lanes = lanes + lanes[:, torch.arange(32, device="cuda") ^ mask]
+    inv = torch.rsqrt(lanes[:, :1] / width + 1e-6)
+    want = ((v * inv) * weight).to(dtype)
+    ulp = {torch.float32: 2.0 ** -23, torch.float16: 2.0 ** -10, torch.bfloat16: 2.0 ** -7}[dtype]
+    assert torch.allclose(got.float(), want.float(), rtol=ulp * 2, atol=1e-6)
+    for start, stop in ((0, 1), (1, 9), (9, 70)):
+        assert torch.equal(rms_norm(x[start:stop].contiguous(), weight, 1e-6), got[start:stop])
+
+
 def _conv_loop(x, weight, state):
     window = torch.cat((state.float(), x.float()), dim=1)
     out = torch.zeros(x.shape, device="cuda")

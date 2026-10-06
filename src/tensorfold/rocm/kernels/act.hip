@@ -52,6 +52,57 @@ __global__ void __launch_bounds__(kRmsThreads) rms_kernel(const T* __restrict__ 
     }
 }
 
+// Rows up to 32 * PER wide, one wave a row and the row in its registers: the sum of squares is rms_kernel's (lane l
+// adds l, l + 32, ... then the xor tree) and so are the scaling and rounding, so the bits are too. The block kernel
+// keeps an 8192-float row in LDS for the one wave that sums it; on 128-wide head rows that was most of its time.
+constexpr int kRmsRowsWaves = 8;
+
+template <typename T, int PER>
+__global__ void __launch_bounds__(32 * kRmsRowsWaves) rms_rows_kernel(const T* __restrict__ x,
+                                                                      const float* __restrict__ weight,
+                                                                      T* __restrict__ y, int rows, int width,
+                                                                      float eps) {
+    const int lane = threadIdx.x & 31;
+    const int row = blockIdx.x * kRmsRowsWaves + (threadIdx.x >> 5);
+    if (row >= rows) return;
+    const T* in = x + static_cast<long long>(row) * width;
+    float v[PER];
+    float sum = 0.f;
+#pragma unroll
+    for (int i = 0; i < PER; ++i) {
+        const int at = lane + 32 * i;
+        v[i] = at < width ? widen(in[at]) : 0.f;
+        if (at < width) sum += v[i] * v[i];
+    }
+    const float inv = rsqrtf(warp_sum(sum) / static_cast<float>(width) + eps);
+    T* out = y + static_cast<long long>(row) * width;
+#pragma unroll
+    for (int i = 0; i < PER; ++i) {
+        const int at = lane + 32 * i;
+        if (at < width) {
+            float value = v[i] * inv;
+            if (weight != nullptr) value *= weight[at];
+            narrow(value, out + at);
+        }
+    }
+}
+
+template <typename T>
+bool rms_rows_launch(const T* x, const float* weight, T* y, int rows, int width, float eps, hipStream_t stream) {
+    const dim3 grid((rows + kRmsRowsWaves - 1) / kRmsRowsWaves);
+    const dim3 block(32 * kRmsRowsWaves);
+    if (width <= 128) {
+        rms_rows_kernel<T, 4><<<grid, block, 0, stream>>>(x, weight, y, rows, width, eps);
+    } else if (width <= 256) {
+        rms_rows_kernel<T, 8><<<grid, block, 0, stream>>>(x, weight, y, rows, width, eps);
+    } else if (width <= 512) {
+        rms_rows_kernel<T, 16><<<grid, block, 0, stream>>>(x, weight, y, rows, width, eps);
+    } else {
+        return false;
+    }
+    return true;
+}
+
 // Length 1. Taps run in order, then the state shifts toward the new sample.
 __global__ void conv_decode_kernel(const float* __restrict__ x, const float* __restrict__ weight,
                                    float* __restrict__ state, float* __restrict__ y, int channels, int kernel) {
@@ -274,7 +325,15 @@ __global__ void gdn_gate_kernel(const T* __restrict__ a, const T* __restrict__ b
 
 void rms_launch(const void* x, const float* weight, void* y, int kind, int rows, int width, float eps,
                 hipStream_t stream) {
-    if (kind == 1) {
+    const bool short_rows =
+        kind == 1   ? tf::rocm::rms_rows_launch(static_cast<const __half*>(x), weight, static_cast<__half*>(y), rows,
+                                                width, eps, stream)
+        : kind == 2 ? tf::rocm::rms_rows_launch(static_cast<const hip_bfloat16*>(x), weight,
+                                                static_cast<hip_bfloat16*>(y), rows, width, eps, stream)
+                    : tf::rocm::rms_rows_launch(static_cast<const float*>(x), weight, static_cast<float*>(y), rows,
+                                                width, eps, stream);
+    if (short_rows) {
+    } else if (kind == 1) {
         tf::rocm::rms_kernel<__half><<<rows, tf::rocm::kRmsThreads, 0, stream>>>(static_cast<const __half*>(x), weight,
                                                                static_cast<__half*>(y), width, eps);
     } else if (kind == 2) {
