@@ -437,6 +437,10 @@ __global__ void __launch_bounds__(256, 1) affine_dot2_block(Affine a) {
     __shared__ typename T::elem xs[2][kBlockM * kBlockLd];
     __shared__ typename T::elem ws[2][kBlockN * kBlockLd];
     __shared__ float rowsum[kBlockM];
+    // bf16 scales and biases eight groups at a time, [column][group]: one 16-byte read a column and table instead of
+    // every thread reading its eight columns' values one by one at each group's fold. Same values, same bits.
+    __shared__ alignas(16) uint16_t ssc[kBlockN * 8];
+    __shared__ alignas(16) uint16_t sbi[kBlockN * 8];
     const int tx = threadIdx.x & 15;
     const int ty = threadIdx.x >> 4;
     const int m0 = blockIdx.y * kBlockM;
@@ -448,6 +452,9 @@ __global__ void __launch_bounds__(256, 1) affine_dot2_block(Affine a) {
     float acc[8][8];
     float dot[8][8];
     float run = 0.f;                     // thread r < kBlockM: row r's sum of x since the group began
+    const bool staged = a.scale.kind == kScaleBF16 && a.bias.kind == kScaleBF16 && groups % 8 == 0 &&
+                        ((reinterpret_cast<uintptr_t>(a.scale.p) | reinterpret_cast<uintptr_t>(a.bias.p)) & 15) == 0;
+    const int chunk = 8 * per;           // stages a staged slab of eight groups lasts
 #pragma unroll
     for (int i = 0; i < 8; ++i) {
 #pragma unroll
@@ -460,6 +467,16 @@ __global__ void __launch_bounds__(256, 1) affine_dot2_block(Affine a) {
     __syncthreads();
     for (int s = 0; s < stages; ++s) {
         const int cur = s & 1;
+        uint4 sq = make_uint4(0u, 0u, 0u, 0u), bq = sq;
+        const bool slab = staged && s % chunk == 0 && static_cast<int>(threadIdx.x) < kBlockN;
+        if (slab) {
+            const int col = n0 + static_cast<int>(threadIdx.x);
+            if (col < a.n) {
+                const long long at = static_cast<long long>(col) * groups + s / per;
+                sq = *reinterpret_cast<const uint4*>(static_cast<const uint16_t*>(a.scale.p) + at);
+                bq = *reinterpret_cast<const uint4*>(static_cast<const uint16_t*>(a.bias.p) + at);
+            }
+        }
         StageRegs<BITS> next;
         if (s + 1 < stages) fetch_block<T, BITS>(next, a, m0, n0, (s + 1) * kBlockK, words_row);
         const typename T::elem* xb = xs[cur];
@@ -491,6 +508,10 @@ __global__ void __launch_bounds__(256, 1) affine_dot2_block(Affine a) {
             }
         }
         if (s + 1 < stages) put_block<T, BITS>(next, xs[cur ^ 1], ws[cur ^ 1], a, n0);
+        if (slab) {
+            reinterpret_cast<uint4*>(ssc)[threadIdx.x] = sq;
+            reinterpret_cast<uint4*>(sbi)[threadIdx.x] = bq;
+        }
         if (s % per == per - 1) {
             if (static_cast<int>(threadIdx.x) < kBlockM) {
                 rowsum[threadIdx.x] = run;
@@ -501,9 +522,16 @@ __global__ void __launch_bounds__(256, 1) affine_dot2_block(Affine a) {
 #pragma unroll
             for (int j = 0; j < 8; ++j) {
                 const int col = n0 + tx + 16 * j;
-                const long long at = static_cast<long long>(col < a.n ? col : 0) * groups + g;
-                const float scale = a.scale[at];
-                const float bias = a.bias[at];
+                float scale, bias;
+                if (staged) {
+                    const int slot = (tx + 16 * j) * 8 + (g & 7);
+                    scale = __uint_as_float(static_cast<uint32_t>(ssc[slot]) << 16);
+                    bias = __uint_as_float(static_cast<uint32_t>(sbi[slot]) << 16);
+                } else {
+                    const long long at = static_cast<long long>(col < a.n ? col : 0) * groups + g;
+                    scale = a.scale[at];
+                    bias = a.bias[at];
+                }
 #pragma unroll
                 for (int i = 0; i < 8; ++i) {
                     acc[i][j] = fmaf(dot[i][j], scale, acc[i][j]);

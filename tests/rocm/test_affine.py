@@ -385,7 +385,8 @@ def test_fp16_gemm_tile_matches_the_one_thread_kernel(bits, group):
 def test_bf16_dot2_rows_keep_their_bits_on_gfx11(bits, group, groups):
     """gfx11 BF16 dot2 tiles: a row's bits are the same alone, in a short batch and in a prefill tile, and the
     decode tile's own bf16 rounding equals the cast of its fp32 result. 8 and 32 groups take the one-row tile's
-    vector loads of the scales and biases; 10 its scalar ones."""
+    vector loads of the scales and biases and the prefill tile's staged slabs of eight groups; 10 their scalar
+    loads."""
 
     if gfx_name() not in WMMA:
         pytest.skip("the BF16 dot2 tiles are the gfx11 / gfx12 schedule")
