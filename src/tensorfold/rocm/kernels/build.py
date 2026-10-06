@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import threading
 from typing import Any
 
@@ -83,15 +84,21 @@ def load(name: str, sources: list[str], **kwargs: Any) -> Any:
 def _digest(sources: list[str], kwargs: dict[str, Any]) -> str:
     """Twelve hex digits over the flags, every source, and every header in the source and include directories.
 
-    A ``.hip`` file counts as a header too: attention.hip includes attention_fa.hip, and an edit there has to rebuild.
+    A ``.hip`` file a source includes counts too: attention.hip includes attention_fa.hip, and an edit there has to
+    rebuild that extension (and only that one).
     """
 
     folders = {os.path.dirname(os.path.abspath(source)) for source in sources}
     folders.update(os.path.abspath(path) for path in kwargs.get("extra_include_paths", ()))
-    listed = {os.path.abspath(source) for source in sources}
     headers = sorted(os.path.join(folder, entry) for folder in folders for entry in os.listdir(folder)
-                     if entry.endswith((".hpp", ".h", ".cuh", ".hip"))
-                     and os.path.join(folder, entry) not in listed)
+                     if entry.endswith((".hpp", ".h", ".cuh")))
+    listed = {os.path.abspath(source) for source in sources}
+    for source in sources:
+        with open(source, encoding="utf-8", errors="replace") as handle:
+            for name in re.findall(r'^\s*#\s*include\s+"([^"]+\.hip)"', handle.read(), flags=re.M):
+                path = os.path.join(os.path.dirname(os.path.abspath(source)), name)
+                if os.path.exists(path) and path not in listed and path not in headers:
+                    headers.append(path)
     digest = hashlib.sha256(repr(sorted((k, repr(v)) for k, v in kwargs.items() if k != "verbose")).encode())
     for path in [*sources, *headers]:
         digest.update(os.path.basename(path).encode())

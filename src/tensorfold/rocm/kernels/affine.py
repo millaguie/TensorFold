@@ -64,7 +64,8 @@ def matmul(x: torch.Tensor, words: torch.Tensor, scale: torch.Tensor, bias: torc
     half = (not f32 and x.dtype == torch.float16 and m <= 8 and which == 0 and split_mode != 2
             and gfx_name() not in WMMA)
     # The gfx11 / gfx12 decode tile rounds its bf16 output itself, as the cast after would.
-    brain = not f32 and x.dtype == torch.bfloat16 and m <= 8 and which == 0 and split_mode != 2
+    brain = (not f32 and x.dtype == torch.bfloat16 and m <= 8 and which == 0 and split_mode != 2
+             and gfx_name() in WMMA)
     out = torch.empty((m, n), dtype=torch.float16 if half else torch.bfloat16 if brain else torch.float32,
                       device=x.device)
     _ext().affine(x, words.contiguous(), scale, bias, out, bits, group, which, split_mode)

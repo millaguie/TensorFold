@@ -420,3 +420,17 @@ def test_rows_group_matches_solo_launches(m):
     assert outs is not None
     for (words, scale, bias), out in zip(packs, outs):
         assert torch.equal(out, matmul(x, words, scale, bias, bits=4, group=group))
+
+
+def test_bf16_decode_output_rounds_nan_as_torch_does():
+    """The decode tile's own bf16 rounding of a NaN row is torch's cast: the quiet 0x7FC0, sign and payload dropped."""
+
+    if gfx_name() not in WMMA:
+        pytest.skip("the bf16 output is the gfx11 / gfx12 decode tile")
+    _, words, scale, bias = _pack(96, 512, 4, 64, 77)
+    words, scale, bias = words.cuda(), scale.to(torch.bfloat16).cuda(), bias.to(torch.bfloat16).cuda()
+    x = torch.randn((2, 512), device="cuda", dtype=torch.bfloat16)
+    x[0, 5] = -float("nan")
+    want = matmul(x, words, scale, bias, bits=4, group=64, f32=True).to(torch.bfloat16)
+    got = matmul(x, words, scale, bias, bits=4, group=64)
+    assert torch.equal(got.view(torch.int16), want.view(torch.int16))

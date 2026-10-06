@@ -116,7 +116,7 @@ __global__ void __launch_bounds__(kLaneCols * kLaneWaves) affine_dot2_lanes(Affi
             if (a.out16 != nullptr) {
                 a.out16[out_row(a, r) * a.n + col] = __float2half_rn(acc[r]);
             } else if (a.outb16 != nullptr) {
-                a.outb16[out_row(a, r) * a.n + col] = hip_bfloat16(acc[r]);
+                a.outb16[out_row(a, r) * a.n + col] = bf16_like_torch(acc[r]);
             } else {
                 a.out[out_row(a, r) * a.n + col] = acc[r];
             }
@@ -248,7 +248,7 @@ __device__ __forceinline__ void row_tile(const Affine& a, int lpc, int bx) {
             if (a.out16 != nullptr) {
                 a.out16[out_row(a, r) * a.n + mine] = __float2half_rn(acc[r]);
             } else if (a.outb16 != nullptr) {
-                a.outb16[out_row(a, r) * a.n + mine] = hip_bfloat16(acc[r]);
+                a.outb16[out_row(a, r) * a.n + mine] = bf16_like_torch(acc[r]);
             } else {
                 a.out[out_row(a, r) * a.n + mine] = acc[r];
             }

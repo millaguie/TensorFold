@@ -68,6 +68,14 @@ __device__ inline __half piece_code(const uint32_t (&w)[BITS], int t) {
     return __ushort2half_rn(static_cast<unsigned short>(piece_bits<BITS>(w, t)));
 }
 
+// torch's float to bf16 cast: round to nearest even, and every NaN to the one quiet NaN 0x7FC0 (hip_bfloat16 keeps
+// a NaN's sign and payload), so a tile that rounds its own output matches the cast after an fp32 one.
+__device__ inline hip_bfloat16 bf16_like_torch(float v) {
+    hip_bfloat16 out(v);
+    if (v != v) out.data = 0x7FC0;
+    return out;
+}
+
 // Activation types of the tiles: FP16 v_dot2_f32_f16 (RDNA2) and BF16 v_dot2_f32_bf16 (gfx11 / gfx12).
 struct DotF16 {
     using elem = __half;
