@@ -129,6 +129,31 @@ def matmul_pair(x: torch.Tensor, words_a: torch.Tensor, scale_a: torch.Tensor, b
     return out_a.to(x.dtype), out_b.to(x.dtype)
 
 
+def matmul_rows(x: torch.Tensor, packeds: tuple, *, bits: int, group: int):
+    """Up to four products of a one- or two-row BF16 ``x`` in one launch of the gfx11 / gfx12 row tile, bf16 out.
+
+    Each output has the bits of its solo ``matmul``. None when a product would not take the row tile alone.
+    """
+
+    if not 1 <= len(packeds) <= 4 or x.ndim != 2 or x.dtype != torch.bfloat16 or not x.is_contiguous():
+        return None
+    m, k = x.shape
+    if m > 2 or k % group or bits not in BITS or group not in GROUPS:
+        return None
+    words, scale, bias, outs = [], [], [], []
+    for packed in packeds:
+        w, s, b, n = _as_affine(*packed, k, bits, group)
+        words.append(w)
+        scale.append(s)
+        bias.append(b)
+        outs.append(torch.empty((m, n), dtype=torch.bfloat16, device=x.device))
+    if len({t.dtype for t in scale + bias}) != 1:
+        return None
+    if not _ext().affine_rows(x, words, scale, bias, outs, bits, group):
+        return None
+    return tuple(outs)
+
+
 def matmul_group(x: torch.Tensor, packeds: tuple, *, bits: int, group: int, f32: bool = False):
     """Up to four packed products that share ``x``. Each side matches a solo WMMA launch."""
 

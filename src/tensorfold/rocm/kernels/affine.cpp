@@ -157,6 +157,51 @@ void affine_group(const at::Tensor& x, std::vector<at::Tensor> words, std::vecto
                         static_cast<int>(k), static_cast<int>(bits), static_cast<int>(group), stream.stream());
 }
 
+bool affine_rows(const at::Tensor& x, std::vector<at::Tensor> words, std::vector<at::Tensor> scale,
+                 std::vector<at::Tensor> bias, std::vector<at::Tensor> out, int64_t bits, int64_t group) {
+    TORCH_CHECK(x.is_cuda() && x.is_contiguous() && x.scalar_type() == at::kBFloat16 && x.dim() == 2, "x bf16");
+    const int64_t count = static_cast<int64_t>(words.size());
+    TORCH_CHECK(count >= 1 && count <= 4 && scale.size() == words.size() && bias.size() == words.size() &&
+                    out.size() == words.size(),
+                "rows group takes 1 to 4 products");
+    const int64_t m = x.size(0), k = x.size(1);
+    TORCH_CHECK(m >= 1 && m <= 2 && k % group == 0 && (k * bits) % 32 == 0, "rows group: m 1 or 2, whole groups");
+    const void* wptr[4] = {};
+    const void* sptr[4] = {};
+    const void* bptr[4] = {};
+    void* optr[4] = {};
+    int ns[4] = {};
+    std::vector<at::Tensor> kept{x};
+    for (int64_t i = 0; i < count; ++i) {
+        const int64_t n = words[i].size(0);
+        TORCH_CHECK(words[i].is_cuda() && words[i].is_contiguous() && words[i].scalar_type() == at::kInt &&
+                        words[i].dim() == 2 && words[i].size(1) == k * bits / 32,
+                    "words");
+        TORCH_CHECK(scale[i].is_cuda() && bias[i].is_cuda() && scale[i].is_contiguous() && bias[i].is_contiguous() &&
+                        scale[i].scalar_type() == scale[0].scalar_type() &&
+                        bias[i].scalar_type() == scale[0].scalar_type() && scale[i].size(0) == n &&
+                        scale[i].size(1) == k / group && bias[i].sizes() == scale[i].sizes(),
+                    "rows group tables: contiguous (N, K / group), one type");
+        TORCH_CHECK(out[i].is_cuda() && out[i].is_contiguous() && out[i].scalar_type() == at::kBFloat16 &&
+                        out[i].size(0) == m && out[i].size(1) == n,
+                    "rows group out: (M, N) bf16");
+        wptr[i] = words[i].data_ptr();
+        sptr[i] = scale[i].data_ptr();
+        bptr[i] = bias[i].data_ptr();
+        optr[i] = out[i].data_ptr();
+        ns[i] = static_cast<int>(n);
+        for (const at::Tensor& t : {words[i], scale[i], bias[i], out[i]}) kept.push_back(t);
+    }
+    c10::cuda::CUDAGuard guard(x.device());
+    auto stream = c10::cuda::getCurrentCUDAStream();
+    for (const at::Tensor& tensor : kept) {
+        c10::cuda::CUDACachingAllocator::recordStream(tensor.storage().data_ptr(), stream);
+    }
+    return affine_rows_group_launch(x.data_ptr(), wptr, sptr, bptr, scale_kind(scale[0]), optr, ns,
+                                    static_cast<int>(count), static_cast<int>(m), static_cast<int>(k),
+                                    static_cast<int>(bits), static_cast<int>(group), stream.stream());
+}
+
 void affine_routed(const at::Tensor& x, const at::Tensor& words, const at::Tensor& scale, const at::Tensor& bias,
                    at::Tensor& out, const at::Tensor& items, const at::Tensor& members, int64_t x_div, int64_t rows,
                    int64_t bits, int64_t group) {
@@ -201,4 +246,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("affine_routed", &affine_routed);
     m.def("affine_pair", &affine_pair);
     m.def("affine_group", &affine_group);
+    m.def("affine_rows", &affine_rows);
 }

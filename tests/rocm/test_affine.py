@@ -400,3 +400,23 @@ def test_bf16_dot2_rows_keep_their_bits_on_gfx11(bits, group, groups):
         assert torch.equal(matmul(x[:m], words, scale, bias, bits=bits, group=group), tall[:m].to(torch.bfloat16)), m
     want = _reference(x[:4], codes, scale.float().cpu(), bias.float().cpu(), group)
     assert torch.allclose(tall[:4].cpu(), want, rtol=2e-3, atol=2e-3)
+
+
+@pytest.mark.parametrize("m", [1, 2])
+def test_rows_group_matches_solo_launches(m):
+    """One launch of up to four products of a decode row: every output has its solo launch's bits."""
+
+    from tensorfold.rocm.kernels.affine import matmul_rows
+
+    if gfx_name() not in WMMA:
+        pytest.skip("the grouped row tile is the gfx11 / gfx12 BF16 schedule")
+    k, group = 2048, 64
+    packs = []
+    for i, n in enumerate((640, 128, 32, 7)):
+        _, words, scale, bias = _pack(n, k, 4, group, 90 + i)
+        packs.append((words.cuda(), scale.to(torch.bfloat16).cuda(), bias.to(torch.bfloat16).cuda()))
+    x = torch.randn((m, k), device="cuda", dtype=torch.bfloat16)
+    outs = matmul_rows(x, tuple(packs), bits=4, group=group)
+    assert outs is not None
+    for (words, scale, bias), out in zip(packs, outs):
+        assert torch.equal(out, matmul(x, words, scale, bias, bits=4, group=group))

@@ -99,6 +99,17 @@ class Engine:
         if self.dtype is None:
             self.dtype = activation_dtype(gfx_name())
         flat = x.reshape(-1, x.shape[-1]).to(dtype=self.dtype).contiguous()
+        # A decode step's projections take one launch of the row tile, each with its solo launch's bits.
+        if (2 <= len(packeds) <= 4 and flat.shape[0] <= 2 and self.schedule == "auto"
+                and self.dtype == torch.bfloat16 and gfx_name() in WMMA
+                and all(not p.partial and p.bits == packeds[0].bits and p.group == packeds[0].group
+                        for p in packeds)):
+            outs = affine_mod.matmul_rows(flat, tuple((p.words, p.scale, p.bias) for p in packeds),
+                                          bits=packeds[0].bits, group=packeds[0].group)
+            if outs is not None:
+                for packed in packeds:
+                    self._note(flat, packed)
+                return outs
         same = (2 <= len(packeds) <= 4 and flat.shape[0] <= 16 and self.schedule == "wmma"
                 and self.dtype == torch.bfloat16 and gfx_name() in WMMA
                 and all(p.bits == 8 and p.group == packeds[0].group for p in packeds))

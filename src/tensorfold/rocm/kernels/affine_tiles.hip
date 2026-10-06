@@ -130,9 +130,8 @@ __global__ void __launch_bounds__(kLaneCols * kLaneWaves) affine_dot2_lanes(Affi
 constexpr int kRowWaves = 4;
 constexpr int kRowCols = 32;
 
-template <typename T, int BITS, int PIECES, int ROWS = 1>
-__global__ void __launch_bounds__(32 * kRowWaves) affine_dot2_row(Affine a, int lpc) {
-    if (!take_item(a, blockIdx.z)) return;
+template <typename T, int BITS, int PIECES, int ROWS>
+__device__ __forceinline__ void row_tile(const Affine& a, int lpc, int bx) {
     constexpr int kGroup = 32 * PIECES;
     __shared__ float dots[ROWS][kRowWaves][kRowCols][33];
     __shared__ float sums[ROWS][kRowWaves][32];
@@ -141,7 +140,7 @@ __global__ void __launch_bounds__(32 * kRowWaves) affine_dot2_row(Affine a, int 
     const int slots = 32 / lpc;                 // columns a pass
     const int slot = lane / lpc;
     const int j = lane % lpc;
-    const int col0 = (blockIdx.x * kRowWaves + wave) * kRowCols;
+    const int col0 = (bx * kRowWaves + wave) * kRowCols;
     const int mine = col0 + lane;               // the column this lane folds
     const int groups = a.k / kGroup;
     const long long words_row = static_cast<long long>(a.k) * BITS / 32;
@@ -257,6 +256,28 @@ __global__ void __launch_bounds__(32 * kRowWaves) affine_dot2_row(Affine a, int 
     }
 }
 
+template <typename T, int BITS, int PIECES, int ROWS = 1>
+__global__ void __launch_bounds__(32 * kRowWaves) affine_dot2_row(Affine a, int lpc) {
+    if (!take_item(a, blockIdx.z)) return;
+    row_tile<T, BITS, PIECES, ROWS>(a, lpc, blockIdx.x);
+}
+
+// Up to four products of one x in one launch: block b runs the row tile of the part whose blocks hold b, the code a
+// solo launch of that part runs, so each output has its solo bits. The narrow ones (the 32-wide gates of the linear
+// attention) no longer cost a launch and a lone latency-bound wave each.
+struct AffineRows {
+    Affine part[4];
+    int first[5];  // part p owns blocks first[p] .. first[p + 1] - 1
+    int count;
+};
+
+template <typename T, int BITS, int PIECES, int ROWS>
+__global__ void __launch_bounds__(32 * kRowWaves) affine_dot2_rows_group(AffineRows g, int lpc) {
+    const int b = blockIdx.x;
+    const int p = b >= g.first[3] && g.count > 3 ? 3 : b >= g.first[2] && g.count > 2 ? 2 : b >= g.first[1] ? 1 : 0;
+    row_tile<T, BITS, PIECES, ROWS>(g.part[p], lpc, b - g.first[p]);
+}
+
 // Lanes a column: the groups rounded up to a power of two, at most 32; under four groups keeps the column tile.
 inline int row_lanes(int groups) {
     if (groups < 4) return 0;
@@ -281,6 +302,27 @@ hipError_t launch_row_as(const Affine& a, int lpc, hipStream_t stream, int items
         case 32: affine_dot2_row<T, BITS, 1><<<grid, block, 0, stream>>>(a, lpc); break;
         case 64: affine_dot2_row<T, BITS, 2><<<grid, block, 0, stream>>>(a, lpc); break;
         default: affine_dot2_row<T, BITS, 4><<<grid, block, 0, stream>>>(a, lpc); break;
+    }
+    return hipGetLastError();
+}
+
+template <typename T, int BITS>
+hipError_t launch_rows_group_as(const AffineRows& g, int lpc, hipStream_t stream) {
+    const dim3 grid(g.first[g.count]);
+    const dim3 block(32 * kRowWaves);
+    const Affine& a = g.part[0];
+    if (a.m == 2) {
+        switch (a.group) {
+            case 32: affine_dot2_rows_group<T, BITS, 1, 2><<<grid, block, 0, stream>>>(g, lpc); break;
+            case 64: affine_dot2_rows_group<T, BITS, 2, 2><<<grid, block, 0, stream>>>(g, lpc); break;
+            default: affine_dot2_rows_group<T, BITS, 4, 2><<<grid, block, 0, stream>>>(g, lpc); break;
+        }
+    } else {
+        switch (a.group) {
+            case 32: affine_dot2_rows_group<T, BITS, 1, 1><<<grid, block, 0, stream>>>(g, lpc); break;
+            case 64: affine_dot2_rows_group<T, BITS, 2, 1><<<grid, block, 0, stream>>>(g, lpc); break;
+            default: affine_dot2_rows_group<T, BITS, 4, 1><<<grid, block, 0, stream>>>(g, lpc); break;
+        }
     }
     return hipGetLastError();
 }
@@ -358,6 +400,45 @@ hipError_t launch_affine_dot2_lanes(const Affine& a, hipStream_t stream, int ite
         case 8: return launch_lanes<8>(a, stream, items);
         default: return hipErrorInvalidValue;
     }
+}
+
+// The parts share x, m, k, bits, group and the scale type. hipErrorNotSupported when a solo launch of one of them
+// would not take the row tile, so the caller keeps the solo launches.
+hipError_t launch_affine_dot2_rows_group(const Affine* parts, int count, hipStream_t stream) {
+#if TENSORFOLD_RDNA_WMMA
+    if (count < 1 || count > 4) return hipErrorInvalidValue;
+    const Affine& a = parts[0];
+    if (a.fp16 || a.m < 1 || a.m > 2 || a.group % 32 || a.group > kLaneGroupMax || a.k % a.group || a.k % 16) {
+        return hipErrorNotSupported;
+    }
+    const int lpc = row_lanes(a.k / a.group);
+    if (lpc == 0) return hipErrorNotSupported;
+    AffineRows g{};
+    g.count = count;
+    for (int p = 0; p < count; ++p) {
+        const Affine& b = parts[p];
+        if (b.m != a.m || b.k != a.k || b.bits != a.bits || b.group != a.group || b.fp16 || b.n < 1 ||
+            b.scale.kind != a.scale.kind) {
+            return hipErrorNotSupported;
+        }
+        g.part[p] = b;
+        g.first[p + 1] = g.first[p] + (b.n + kRowWaves * kRowCols - 1) / (kRowWaves * kRowCols);
+    }
+    switch (a.bits) {
+        case 2: return launch_rows_group_as<DotBF16, 2>(g, lpc, stream);
+        case 3: return launch_rows_group_as<DotBF16, 3>(g, lpc, stream);
+        case 4: return launch_rows_group_as<DotBF16, 4>(g, lpc, stream);
+        case 5: return launch_rows_group_as<DotBF16, 5>(g, lpc, stream);
+        case 6: return launch_rows_group_as<DotBF16, 6>(g, lpc, stream);
+        case 8: return launch_rows_group_as<DotBF16, 8>(g, lpc, stream);
+        default: return hipErrorNotSupported;
+    }
+#else
+    (void)parts;
+    (void)count;
+    (void)stream;
+    return hipErrorNotSupported;
+#endif
 }
 
 // GEMM tile: 128 x 128, a thread 8 rows x 8 columns strided by 16, K through double-buffered LDS 32 codes a stage.
@@ -657,4 +738,19 @@ void affine_routed_launch(const void* x, const void* words, const void* scale, c
     a.route.x_div = x_div;
     hipError_t err = tf::rocm::launch_affine_dot2_routed(a, count, static_cast<hipStream_t>(stream));
     if (err != hipSuccess) throw std::runtime_error(std::string("affine routed kernel: ") + hipGetErrorString(err));
+}
+
+bool affine_rows_group_launch(const void* x, const void* const* words, const void* const* scale,
+                              const void* const* bias, int scale_kind, void* const* out, const int* ns, int count,
+                              int m, int k, int bits, int group, void* stream) {
+    tf::rocm::Affine parts[4];
+    for (int p = 0; p < count && p < 4; ++p) {
+        parts[p] = tf::rocm::Affine{x, static_cast<const uint32_t*>(words[p]), {scale[p], scale_kind},
+                                    {bias[p], scale_kind}, nullptr, m, ns[p], k, bits, group, 0};
+        parts[p].outb16 = static_cast<hip_bfloat16*>(out[p]);
+    }
+    hipError_t err = tf::rocm::launch_affine_dot2_rows_group(parts, count, static_cast<hipStream_t>(stream));
+    if (err == hipErrorNotSupported) return false;
+    if (err != hipSuccess) throw std::runtime_error(std::string("affine rows group: ") + hipGetErrorString(err));
+    return true;
 }

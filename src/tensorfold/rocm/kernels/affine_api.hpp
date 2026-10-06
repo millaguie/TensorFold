@@ -17,3 +17,8 @@ void affine_group_launch(const void* x, const void* const* words, const void* co
 void affine_routed_launch(const void* x, const void* words, const void* scale, const void* bias, int scale_kind,
                           void* out, const int* items, int count, const int* members, int x_div, int rows, int n,
                           int k, int bits, int group, int fp16, void* stream);
+// Up to four products of one bf16 x with m <= 2 on the gfx11 / gfx12 one-row tile, bf16 out (m, n) each, every
+// output with its solo launch's bits. False when a part would not take the row tile alone.
+bool affine_rows_group_launch(const void* x, const void* const* words, const void* const* scale,
+                              const void* const* bias, int scale_kind, void* const* out, const int* ns, int count,
+                              int m, int k, int bits, int group, void* stream);
