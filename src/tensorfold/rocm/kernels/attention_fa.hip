@@ -320,6 +320,53 @@ __device__ void fa_load_tile(Cache* dst, const Cache* src, int k0, int span, int
     }
 }
 
+// fa_load_tile's 16-byte path in two halves: fetch a tile into registers (8 chunks a thread at d = 256), put it into
+// LDS later, so the next tile's reads are in flight while the block works on the current one.
+constexpr int kFaPrefetch = 8;
+
+template <typename Cache, int Bc>
+__device__ inline bool fa_vec8(const Cache* src, int d, long long stride) {
+    return sizeof(Cache) == 2 && (d % 8) == 0 && (stride % 8) == 0 && (reinterpret_cast<uintptr_t>(src) & 15u) == 0 &&
+           Bc * (d >> 3) <= kFaPrefetch * kFaThreads;
+}
+
+template <typename Cache, int Bc>
+__device__ inline void fa_fetch_tile(uint4 (&regs)[kFaPrefetch], const Cache* src, int k0, int span, int d,
+                                     long long stride, int tid) {
+    const int chunks = d >> 3;
+#pragma unroll
+    for (int i = 0; i < kFaPrefetch; ++i) {
+        const int e = tid + i * kFaThreads;
+        regs[i] = make_uint4(0u, 0u, 0u, 0u);
+        if (e < Bc * chunks) {
+            const int key = e / chunks;
+            const int chunk = e - key * chunks;
+            if (k0 + key < span) {
+                regs[i] = *reinterpret_cast<const uint4*>(src + static_cast<long long>(k0 + key) * stride + chunk * 8);
+            }
+        }
+    }
+}
+
+template <typename Cache, int Bc>
+__device__ inline void fa_put_tile(Cache* dst, const uint4 (&regs)[kFaPrefetch], int d, int tid) {
+    constexpr int ld = fa_ld<Cache>();
+    const int chunks = d >> 3;
+#pragma unroll
+    for (int i = 0; i < kFaPrefetch; ++i) {
+        const int e = tid + i * kFaThreads;
+        if (e < Bc * chunks) {
+            const int key = e / chunks;
+            const int chunk = e - key * chunks;
+            unsigned* slot = reinterpret_cast<unsigned*>(dst + key * ld + chunk * 8);
+            slot[0] = regs[i].x;
+            slot[1] = regs[i].y;
+            slot[2] = regs[i].z;
+            slot[3] = regs[i].w;
+        }
+    }
+}
+
 template <typename Cache, int Bc>
 __global__ void __launch_bounds__(kFaThreads, 1)
 fa_prefill(const float* __restrict__ q, const Cache* __restrict__ k, const Cache* __restrict__ v,
@@ -369,9 +416,18 @@ fa_prefill(const float* __restrict__ q, const Cache* __restrict__ k, const Cache
     }
     __syncthreads();
 
+    // Same tiles, same arithmetic; only when the reads are issued moves.
+    const bool ahead = fa_vec8<Cache, Bc>(kbase, d, k_ss) && fa_vec8<Cache, Bc>(vbase, d, v_ss);
+    uint4 next[kFaPrefetch];
+    if (ahead) fa_fetch_tile<Cache, Bc>(next, kbase, 0, span, d, k_ss, tid);
     for (int k0 = 0; k0 < max_vis; k0 += Bc) {
-        fa_load_tile<Cache, Bc>(sK, kbase, k0, span, d, k_ss, tid);
+        if (ahead) {
+            fa_put_tile<Cache, Bc>(sK, next, d, tid);
+        } else {
+            fa_load_tile<Cache, Bc>(sK, kbase, k0, span, d, k_ss, tid);
+        }
         __syncthreads();
+        if (ahead) fa_fetch_tile<Cache, Bc>(next, vbase, k0, span, d, v_ss, tid);
 #pragma unroll 1
         for (int iter = 0; iter < kBr / kWarps; ++iter) {
             int row = warp + iter * kWarps;
@@ -433,8 +489,13 @@ fa_prefill(const float* __restrict__ q, const Cache* __restrict__ k, const Cache
             }
         }
         __syncthreads();
-        fa_load_tile<Cache, Bc>(sK, vbase, k0, span, d, v_ss, tid);
+        if (ahead) {
+            fa_put_tile<Cache, Bc>(sK, next, d, tid);
+        } else {
+            fa_load_tile<Cache, Bc>(sK, vbase, k0, span, d, v_ss, tid);
+        }
         __syncthreads();
+        if (ahead && k0 + Bc < max_vis) fa_fetch_tile<Cache, Bc>(next, kbase, k0 + Bc, span, d, k_ss, tid);
         if (tid < d) {
             float pv[kBr];
 #pragma unroll
