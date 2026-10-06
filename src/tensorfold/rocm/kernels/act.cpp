@@ -71,7 +71,7 @@ void conv_prefill(const at::Tensor& x, const at::Tensor& weight, const at::Tenso
                     state.sizes() == at::IntArrayRef({batch, kernel - 1, channels}),
                 "state: (batch, kernel - 1, channels) fp32");
     TORCH_CHECK(y.is_cuda() && y.is_contiguous() && y.scalar_type() == at::kFloat && y.sizes() == x.sizes(), "y");
-    TORCH_CHECK(length <= 65535, "length: at most 65535 a launch");
+    TORCH_CHECK(length <= 65535 && batch <= 65535, "length and batch: at most 65535 a launch");
     c10::cuda::CUDAGuard guard(x.device());
     auto stream = c10::cuda::getCurrentCUDAStream();
     for (const at::Tensor& tensor : {x, weight, state, y}) keep(tensor, stream);

@@ -217,7 +217,11 @@ _CONV_TYPES = (torch.float32, torch.float16, torch.bfloat16)
 
 def causal_conv(x: torch.Tensor, weight: torch.Tensor, state: torch.Tensor | None, *,
                 exact: bool = False, in_place: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
-    """Depthwise causal conv; ``exact`` keeps the prefill loop, ``in_place`` keeps the state's buffer."""
+    """Depthwise causal conv; ``in_place`` keeps the state's buffer.
+
+    A device prompt takes one kernel with the loop's arithmetic (the same bits), ``exact`` or not; ``exact`` only keeps
+    a one-token step off the decode kernel, whose silu rounds differently.
+    """
 
     batch, length, channels = x.shape
     kernel = weight.shape[1]
@@ -233,7 +237,8 @@ def causal_conv(x: torch.Tensor, weight: torch.Tensor, state: torch.Tensor | Non
         return y.view(batch, 1, channels), state
     if state is None:
         state = x.new_zeros(batch, kernel - 1, channels)
-    if x.is_cuda and length > 1 and 1 <= kernel <= 8 and length <= 65535 and x.dtype in _CONV_TYPES:
+    if (x.is_cuda and length > 1 and 1 <= kernel <= 8 and length <= 65535 and batch <= 65535
+            and x.dtype in _CONV_TYPES):
         # The loop below in one kernel, the same products and adds in the same order: the same bits.
         from tensorfold.rocm.kernels.act import conv_prefill
 
