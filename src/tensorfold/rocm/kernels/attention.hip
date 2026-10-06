@@ -134,6 +134,9 @@ __global__ void softmax_stats(const float* __restrict__ scores, float* __restric
         __syncthreads();
     }
     float max_score = buf[0];
+    // Every wave reads the max before thread 0 reuses buf[0] for its sum: a wave held back (preempted by another
+    // process's work, for one) otherwise reads a partial sum as the max and the head's softmax goes wrong.
+    __syncthreads();
     local = 0.f;
     for (int i = threadIdx.x; i < visible; i += blockDim.x) local += expf(row[i] - max_score);
     buf[threadIdx.x] = local;
