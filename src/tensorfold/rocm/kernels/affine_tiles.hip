@@ -372,6 +372,61 @@ __device__ inline void stage_block(typename T::elem* xs, typename T::elem* ws, c
     }
 }
 
+// stage_block in two halves, so a stage's global reads are in flight while the tile multiplies the current one: fetch
+// into registers before the product loop, put into the other LDS buffer after it.
+template <int BITS>
+struct StageRegs {
+    uint4 lo, hi;
+    uint32_t w[BITS];
+};
+
+template <typename T, int BITS>
+__device__ inline void fetch_block(StageRegs<BITS>& r, const Affine& a, int m0, int n0, int k0, int words_row) {
+    const typename T::elem* x = static_cast<const typename T::elem*>(a.x);
+    const int row = threadIdx.x >> 1;
+    const int half = (threadIdx.x & 1) * 16;
+    const int gr = m0 + row;
+    r.lo = make_uint4(0u, 0u, 0u, 0u);
+    r.hi = r.lo;
+    if (gr < a.m) {
+        const uint4* src = reinterpret_cast<const uint4*>(x + x_row(a, gr) * a.k + k0 + half);
+        r.lo = src[0];
+        r.hi = src[1];
+    }
+    const int gc = n0 + static_cast<int>(threadIdx.x);
+    if (threadIdx.x < kBlockN && gc < a.n) {
+        load_piece<BITS>(a.words + static_cast<long long>(gc) * words_row + k0 / 32 * BITS, r.w);
+    }
+}
+
+template <typename T, int BITS>
+__device__ inline void put_block(const StageRegs<BITS>& r, typename T::elem* xs, typename T::elem* ws, const Affine& a,
+                                 int n0) {
+    {
+        const int row = threadIdx.x >> 1;
+        const int half = (threadIdx.x & 1) * 16;
+        uint32_t* dst = reinterpret_cast<uint32_t*>(xs + row * kBlockLd + half);
+        dst[0] = r.lo.x; dst[1] = r.lo.y; dst[2] = r.lo.z; dst[3] = r.lo.w;
+        dst[4] = r.hi.x; dst[5] = r.hi.y; dst[6] = r.hi.z; dst[7] = r.hi.w;
+    }
+    if (threadIdx.x < kBlockN) {
+        const int c = threadIdx.x;
+        typename T::elem* dst = ws + c * kBlockLd;
+        if (n0 + c < a.n) {
+#pragma unroll
+            for (int t = 0; t < 32; t += 2) {
+                *reinterpret_cast<typename T::pair*>(dst + t) =
+                    T::two(T::template code<BITS>(r.w, t), T::template code<BITS>(r.w, t + 1));
+            }
+        } else {
+#pragma unroll
+            for (int t = 0; t < 32; t += 2) {
+                *reinterpret_cast<typename T::pair*>(dst + t) = T::two(T::zero(), T::zero());
+            }
+        }
+    }
+}
+
 // A row's group sum of x (what the bias multiplies) is one thread's: thread r adds row r's 32 values a stage in k order
 // and keeps the running sum to the group's end, the order every tile uses, so the bits are unchanged; the product loop
 // is then dot2s and LDS reads alone, where each of the 16 threads sharing a row used to add the row again.
@@ -405,7 +460,8 @@ __global__ void __launch_bounds__(256, 1) affine_dot2_block(Affine a) {
     __syncthreads();
     for (int s = 0; s < stages; ++s) {
         const int cur = s & 1;
-        if (s + 1 < stages) stage_block<T, BITS>(xs[cur ^ 1], ws[cur ^ 1], a, m0, n0, (s + 1) * kBlockK, words_row);
+        StageRegs<BITS> next;
+        if (s + 1 < stages) fetch_block<T, BITS>(next, a, m0, n0, (s + 1) * kBlockK, words_row);
         const typename T::elem* xb = xs[cur];
         const typename T::elem* wb = ws[cur];
         if (static_cast<int>(threadIdx.x) < kBlockM) {
@@ -434,6 +490,7 @@ __global__ void __launch_bounds__(256, 1) affine_dot2_block(Affine a) {
                 for (int j = 0; j < 8; ++j) dot[i][j] = T::dot(xv[i], wv[j], dot[i][j]);
             }
         }
+        if (s + 1 < stages) put_block<T, BITS>(next, xs[cur ^ 1], ws[cur ^ 1], a, n0);
         if (s % per == per - 1) {
             if (static_cast<int>(threadIdx.x) < kBlockM) {
                 rowsum[threadIdx.x] = run;
