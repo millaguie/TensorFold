@@ -5,6 +5,11 @@
 
 #include <hip/hip_runtime.h>
 
+// The tree and readfirstlane are the old sums' only on wave32 (build.py passes -mno-wavefrontsize64).
+#if defined(__AMDGCN_WAVEFRONT_SIZE) && __AMDGCN_WAVEFRONT_SIZE != 32
+#error "wave.hpp lane sums are wave32"
+#endif
+
 namespace tf {
 namespace rocm {
 

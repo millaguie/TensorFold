@@ -159,6 +159,8 @@ void affine_group(const at::Tensor& x, std::vector<at::Tensor> words, std::vecto
 
 bool affine_rows(const at::Tensor& x, std::vector<at::Tensor> words, std::vector<at::Tensor> scale,
                  std::vector<at::Tensor> bias, std::vector<at::Tensor> out, int64_t bits, int64_t group) {
+    TORCH_CHECK(bits == 2 || bits == 3 || bits == 4 || bits == 5 || bits == 6 || bits == 8, "bits 2/3/4/5/6/8");
+    TORCH_CHECK(group == 32 || group == 64 || group == 128, "groups of 32, 64 or 128");
     TORCH_CHECK(x.is_cuda() && x.is_contiguous() && x.scalar_type() == at::kBFloat16 && x.dim() == 2, "x bf16");
     const int64_t count = static_cast<int64_t>(words.size());
     TORCH_CHECK(count >= 1 && count <= 4 && scale.size() == words.size() && bias.size() == words.size() &&
