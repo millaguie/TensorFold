@@ -45,6 +45,30 @@ struct W12Step {
 #endif
 };
 
+// The affine tiles' step with the dot2 tiles' bytes: v_dot2_f32_bf16 rounds once a pair of products, and so does a
+// WMMA whose operands hold one pair of k, so the 16-deep product is 8 of them in k order (8 times the instructions).
+struct W12Dot2Step {
+#if TF_DEVICE_WMMA_GFX12
+    __device__ static f32x8 mma(bf16x8 a, bf16x8 b, f32x8 c) {
+        typedef unsigned w12_u32x4 __attribute__((ext_vector_type(4)));
+        const w12_u32x4 aw = __builtin_bit_cast(w12_u32x4, a), bw = __builtin_bit_cast(w12_u32x4, b);
+        const int half = __lane_id() >> 4;  // the lanes of k 8 half .. 8 half + 7
+#pragma unroll
+        for (int p = 0; p < 8; ++p) {
+            const bool mine = half == p / 4;
+            w12_u32x4 ap = {}, bp = {};
+            ap[p % 4] = mine ? aw[p % 4] : 0u;
+            bp[p % 4] = mine ? bw[p % 4] : 0u;
+            c = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(__builtin_bit_cast(bf16x8, ap),
+                                                                  __builtin_bit_cast(bf16x8, bp), c);
+        }
+        return c;
+    }
+#endif
+};
+
+using W12AffineStep = W12Dot2Step;
+
 // The served tile's staging: operand loads undo the stores' swizzle, and the K loop's barriers order LDS. The
 // contract's controls each break one (a swizzle the loads ignore, a K loop without its barriers) and must go red.
 struct W12Exact {

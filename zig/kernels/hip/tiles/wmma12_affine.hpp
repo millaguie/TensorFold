@@ -56,7 +56,7 @@ __device__ __forceinline__ void w12_chunk_words(const uint32_t* src, uint32_t (&
 // One G::BM x G::BN block of an item of the plan (or the plain product). Operand layouts as in wmma12_gemm_tile; Dec
 // reads a column's codes and group terms, Act the rows of x, Epi stores.
 // Rows past m stage zeros and columns past n the last column; neither is stored.
-template <class G, class Dec, class Act, class Epi, class Step = W12Step, class Fault = W12Exact>
+template <class G, class Dec, class Act, class Epi, class Step = W12AffineStep, class Fault = W12Exact>
 __device__ __forceinline__ void wmma12_affine_tile(typename Dec::Args& a) {
 #if TF_DEVICE_WMMA_GFX12
     constexpr int BM = G::BM, BN = G::BN, BK = G::BK, Threads = G::Threads;
@@ -284,7 +284,7 @@ struct W12KpGeo {
 // 8 waves of 32 columns: on gfx1201 it beats 4 waves of 64 wherever the registry can choose it (more of k in flight)
 using W12AffineKp = W12KpGeo<8, 2>;
 
-template <class G, class Dec, class Act, class Epi, class Step = W12Step, class Fault = W12Exact>
+template <class G, class Dec, class Act, class Epi, class Step = W12AffineStep, class Fault = W12Exact>
 __device__ __forceinline__ void wmma12_affine_kp_tile(typename Dec::Args& a) {
 #if TF_DEVICE_WMMA_GFX12
     constexpr int W = G::W, TN = G::TN, BN = G::BN, Threads = G::Threads;
